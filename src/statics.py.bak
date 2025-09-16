@@ -1,0 +1,463 @@
+import numpy as np
+import sys
+import os
+
+# [路径修正] 将项目根目录添加到Python路径中
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# [路径修正] 使用绝对路径导入
+from src.utils.debug_config import DEBUG_SINGLE_SEGMENT
+from src.kinematics import forward_kinematics
+
+def _get_cable_radii(params):
+    """辅助函数，用于获取以米为单位的线缆半径。"""
+    geo = params['Geometry']
+    r_short = geo['short_lines']['diameter_m'] / 2
+    r_long = geo['long_lines']['diameter_m'] / 2
+    return r_short, r_long
+
+def calculate_drive_mapping(q, params):
+    """
+    【驱动映射测量尺】
+    """
+    Lp, kp, phip, kc1, phic1, kc2, phic2 = q
+    geo = params['Geometry']
+    r_short, r_long = _get_cable_radii(params)
+    alphas_short = np.deg2rad(geo['short_lines']['angles_deg'])
+    alphas_long = np.deg2rad(geo['long_lines']['angles_deg'])
+    proximal_len = geo['CMS_proximal_length']
+    distal_len = geo['CMS_distal_length']
+
+    # [V-Final.3] 修正：考虑了坐标系旋转，phi角度需要累加
+    pss_contrib_short = Lp * kp * r_short * np.cos(phip - alphas_short)
+    pss_contrib_long = Lp * kp * r_long * np.cos(phip - alphas_long)
+    proximal_contrib_short = proximal_len * kc1 * r_short * np.cos(phip + phic1 - alphas_short)
+    proximal_contrib_long = proximal_len * kc1 * r_long * np.cos(phip + phic1 - alphas_long)
+    distal_contrib_long = distal_len * kc2 * r_long * np.cos(phip + phic1 + phic2 - alphas_long)
+
+    delta_l_short = pss_contrib_short + proximal_contrib_short
+    delta_l_long = pss_contrib_long + proximal_contrib_long + distal_contrib_long
+    return delta_l_short, delta_l_long
+
+def calculate_elastic_potential_energy(q, params):
+    """
+    【弹性势能记账员】
+    [V-Final] 采用最终版的、更清晰的物理模型。
+    - PSS段的轴向刚度与弯曲刚度解耦。
+    - PSS段与CMS段的弯曲刚度独立。
+    """
+    Lp, kp, phip, kc1, phic1, kc2, phic2 = q
+    geo = params['Geometry']
+    stiff = params['Stiffness']
+    Lp0 = geo['PSS_initial_length']
+    Lc1 = geo['CMS_proximal_length']
+    Lc2 = geo['CMS_distal_length']
+
+    # 从config加载新的刚度参数
+    k_axial_pss = stiff['pss_equivalent_axial_stiffness']
+    EI_bend_pss = stiff['pss_total_equivalent_bending_stiffness']
+    EI_bend_cms = stiff['cms_bending_stiffness']
+
+    # PSS段的势能
+    U_pss_axial = 0.5 * k_axial_pss * (Lp0 - Lp)**2
+    U_pss_bend = 0.5 * EI_bend_pss * Lp * kp**2
+    U_pss = U_pss_axial + U_pss_bend
+
+    # CMS段的势能
+    U_cms1_bend = 0.5 * EI_bend_cms * Lc1 * kc1**2
+    U_cms2_bend = 0.5 * EI_bend_cms * Lc2 * kc2**2
+    U_cms = U_cms1_bend + U_cms2_bend
+
+    # [新增] 物理约束惩罚项，防止Lp为负
+    U_penalty = 0.0
+    if Lp < 0:
+        U_penalty = 1e6 * (Lp**2) # 一个巨大的二次惩罚
+
+    return U_pss + U_cms + U_penalty
+
+def calculate_actuation_potential_energy(q, tensions, params):
+    """
+    【驱动能量记账员】
+    """
+    tau_short = tensions['tensions_short']
+    tau_long = tensions['tensions_long']
+    delta_l_short, delta_l_long = calculate_drive_mapping(q, params)
+    U_tension = - (np.dot(tau_short, delta_l_short) + np.dot(tau_long, delta_l_long))
+    return U_tension
+
+def calculate_gravity_potential_energy(q, params):
+    """
+    【重力势能记账员】
+    """
+    mass_params = params['Mass']
+    g = mass_params['g']
+    m_pss, m_cms1, m_cms2 = mass_params['pss_kg'], mass_params['cms_proximal_kg'], mass_params['cms_distal_kg']
+    _, com_positions = forward_kinematics(q, params)
+    h_pss = com_positions['pss'][2]
+    h_cms1 = com_positions['cms1'][2]
+    h_cms2 = com_positions['cms2'][2]
+    U_gravity = g * (m_pss * h_pss + m_cms1 * h_cms1 + m_cms2 * h_cms2)
+    return U_gravity
+
+def calculate_elastic_gradient_analytical(q, params):
+    """
+    [V-Final] 计算最终版弹性势能 U_elastic 的解析梯度。
+    """
+    Lp, kp, phip, kc1, phic1, kc2, phic2 = q
+    geo = params['Geometry']
+    stiff = params['Stiffness']
+    Lp0 = geo['PSS_initial_length']
+    Lc1 = geo['CMS_proximal_length']
+    Lc2 = geo['CMS_distal_length']
+
+    # 从config加载新的刚度参数
+    k_axial_pss = stiff['pss_equivalent_axial_stiffness']
+    EI_bend_pss = stiff['pss_total_equivalent_bending_stiffness']
+    EI_bend_cms = stiff['cms_bending_stiffness']
+
+    grad_E = np.zeros(7)
+    grad_E[0] = k_axial_pss * (Lp - Lp0) + 0.5 * EI_bend_pss * kp**2
+    grad_E[1] = EI_bend_pss * Lp * kp
+    grad_E[2] = 0.0
+    grad_E[3] = EI_bend_cms * Lc1 * kc1
+    grad_E[4] = 0.0
+    grad_E[5] = EI_bend_cms * Lc2 * kc2
+    grad_E[6] = 0.0
+
+    # 物理约束惩罚项的梯度
+    if Lp < 0:
+        grad_E[0] += 2 * 1e6 * Lp
+
+    return grad_E
+
+def calculate_total_potential_energy(q, tensions, params):
+    """
+    【总能量资产负债表】
+    [已更新] 包含重力项。
+    """
+    U_elastic = calculate_elastic_potential_energy(q, params)
+    U_actuation = calculate_actuation_potential_energy(q, tensions, params)
+    U_gravity = calculate_gravity_potential_energy(q, params)
+    return U_elastic + U_actuation + U_gravity
+
+def calculate_gradient_analytical(q, tensions, params):
+    """
+    【“下山”指南针 - 解析法】
+    [V-Final] 采用最终版的、更清晰的物理模型。
+    """
+    # 1. 计算弹性势能的梯度
+    grad_E = calculate_elastic_gradient_analytical(q, params)
+
+    # 2. 计算驱动势能的梯度
+    tau_short = tensions['tensions_short']
+    tau_long = tensions['tensions_long']
+    tau_vec = np.concatenate([tau_short, tau_long])
+    
+    J_act = calculate_actuation_jacobian_analytical(q, params)
+    grad_A = -J_act.T @ tau_vec
+
+    # 3. 计算重力势能的梯度
+    grad_G = calculate_gravity_gradient_analytical(q, params)
+
+    # 4. 返回总梯度
+    return grad_E + grad_A + grad_G
+
+def calculate_gravity_gradient_analytical(q, params):
+    """
+    [新增] 计算重力势能 U_gravity 的完全解析梯度。
+    """
+    mass_params = params['Mass']
+    g = mass_params['g']
+    m_pss, m_cms1, m_cms2 = mass_params['pss_kg'], mass_params['cms_proximal_kg'], mass_params['cms_distal_kg']
+    
+    # 调用运动学模块计算质心雅可比矩阵
+    # J_coms 是一个字典, 包含 'pss', 'cms1', 'cms2' 三个雅可比矩阵
+    from src.kinematics import calculate_com_jacobians_analytical
+    J_coms = calculate_com_jacobians_analytical(q, params)
+    
+    # 提取每个雅可比矩阵的Z分量 (第三行)
+    J_com_pss_z = J_coms['pss'][2, :]
+    J_com_cms1_z = J_coms['cms1'][2, :]
+    J_com_cms2_z = J_coms['cms2'][2, :]
+    
+    # 根据公式 dU/dq = g * sum(m_k * d_h_k/dq)
+    grad_G = g * (m_pss * J_com_pss_z + m_cms1 * J_com_cms1_z + m_cms2 * J_com_cms2_z)
+    
+    return grad_G
+
+def calculate_gradient(q, tensions, params, epsilon=1e-7):
+    """【数值法-保留备用】"""
+    grad = np.zeros_like(q)
+    for i in range(len(q)):
+        q_plus = q.copy(); q_plus[i] += epsilon
+        U_plus = calculate_total_potential_energy(q_plus, tensions, params)
+        q_minus = q.copy(); q_minus[i] -= epsilon
+        U_minus = calculate_total_potential_energy(q_minus, tensions, params)
+        grad[i] = (U_plus - U_minus) / (2 * epsilon)
+    return grad
+
+def calculate_actuation_jacobian_analytical(q, params):
+    """
+    【驱动雅可比-解析法】
+    计算驱动映射函数 delta_l(q) 对构型q的雅可比矩阵 J_act = d(delta_l)/dq
+    这个矩阵的维度是 (8, 7)，代表8根驱动线缆的长度变化对7个构型变量的敏感度。
+    """
+    Lp, kp, phip, kc1, phic1, kc2, phic2 = q
+    geo = params['Geometry']
+    r_short, r_long = _get_cable_radii(params)
+    alphas_short = np.deg2rad(geo['short_lines']['angles_deg'])
+    alphas_long = np.deg2rad(geo['long_lines']['angles_deg'])
+    proximal_len = geo['CMS_proximal_length']
+    distal_len = geo['CMS_distal_length']
+
+    # 初始化8x7的雅可比矩阵
+    J_act = np.zeros((8, 7))
+    
+    # [V-Final.3] 修正：phi角度累加，求导时应用链式法则
+    # --- 短线组 (Short lines) ---
+    J_act[0:4, 0] = kp * r_short * np.cos(phip - alphas_short)
+    J_act[0:4, 1] = Lp * r_short * np.cos(phip - alphas_short)
+    J_act[0:4, 2] = -Lp * kp * r_short * np.sin(phip - alphas_short) - proximal_len * kc1 * r_short * np.sin(phip + phic1 - alphas_short)
+    J_act[0:4, 3] = proximal_len * r_short * np.cos(phip + phic1 - alphas_short)
+    J_act[0:4, 4] = -proximal_len * kc1 * r_short * np.sin(phip + phic1 - alphas_short)
+    J_act[0:4, 5] = 0
+    J_act[0:4, 6] = 0
+
+    # --- 长线组 (Long lines) ---
+    J_act[4:8, 0] = kp * r_long * np.cos(phip - alphas_long)
+    J_act[4:8, 1] = Lp * r_long * np.cos(phip - alphas_long)
+    J_act[4:8, 2] = -Lp * kp * r_long * np.sin(phip - alphas_long) - proximal_len * kc1 * r_long * np.sin(phip + phic1 - alphas_long) - distal_len * kc2 * r_long * np.sin(phip + phic1 + phic2 - alphas_long)
+    J_act[4:8, 3] = proximal_len * r_long * np.cos(phip + phic1 - alphas_long)
+    J_act[4:8, 4] = -proximal_len * kc1 * r_long * np.sin(phip + phic1 - alphas_long) - distal_len * kc2 * r_long * np.sin(phip + phic1 + phic2 - alphas_long)
+    J_act[4:8, 5] = distal_len * r_long * np.cos(phip + phic1 + phic2 - alphas_long)
+    J_act[4:8, 6] = -distal_len * kc2 * r_long * np.sin(phip + phic1 + phic2 - alphas_long)
+    
+    return J_act
+
+def calculate_actuation_jacobian_numerical(q, params, epsilon=1e-7):
+    """【驱动雅可比-数值法】用于验证解析法的正确性"""
+    J_act_num = np.zeros((8, 7))
+    for i in range(7):
+        q_plus = q.copy()
+        q_plus[i] += epsilon
+        delta_l_short_plus, delta_l_long_plus = calculate_drive_mapping(q_plus, params)
+        delta_l_plus = np.concatenate([delta_l_short_plus, delta_l_long_plus])
+
+        q_minus = q.copy()
+        q_minus[i] -= epsilon
+        delta_l_short_minus, delta_l_long_minus = calculate_drive_mapping(q_minus, params)
+        delta_l_minus = np.concatenate([delta_l_short_minus, delta_l_long_minus])
+        
+        J_act_num[:, i] = (delta_l_plus - delta_l_minus) / (2 * epsilon)
+    return J_act_num
+
+def calculate_hessian(q, tensions, params, epsilon=1e-4):
+    """【数值法-保留备用】"""
+    hessian = np.zeros((len(q), len(q)))
+    for i in range(len(q)):
+        for j in range(len(q)):
+            q_pp = q.copy(); q_pp[i] += epsilon; q_pp[j] += epsilon
+            U_pp = calculate_total_potential_energy(q_pp, tensions, params)
+            q_pm = q.copy(); q_pm[i] += epsilon; q_pm[j] -= epsilon
+            U_pm = calculate_total_potential_energy(q_pm, tensions, params)
+            q_mp = q.copy(); q_mp[i] -= epsilon; q_mp[j] += epsilon
+            U_mp = calculate_total_potential_energy(q_mp, tensions, params)
+            q_mm = q.copy(); q_mm[i] -= epsilon; q_mm[j] -= epsilon
+            U_mm = calculate_total_potential_energy(q_mm, tensions, params)
+            hessian[i, j] = (U_pp - U_pm - U_mp + U_mm) / (4 * epsilon**2)
+    return hessian
+
+def calculate_hessian_numerical_high_precision(q, energy_func, params, tensions=None, epsilon=1e-5):
+    """
+    高精度数值海森矩阵计算 (二阶中心差分)。
+    """
+    hessian = np.zeros((7, 7))
+    for i in range(7):
+        for j in range(i, 7): # 利用对称性，只计算上三角部分
+            q_pp = q.copy(); q_pp[i] += epsilon; q_pp[j] += epsilon
+            q_pm = q.copy(); q_pm[i] += epsilon; q_pm[j] -= epsilon
+            q_mp = q.copy(); q_mp[i] -= epsilon; q_mp[j] += epsilon
+            q_mm = q.copy(); q_mm[i] -= epsilon; q_mm[j] -= epsilon
+
+            if tensions:
+                U_pp = energy_func(q_pp, tensions, params)
+                U_pm = energy_func(q_pm, tensions, params)
+                U_mp = energy_func(q_mp, tensions, params)
+                U_mm = energy_func(q_mm, tensions, params)
+            else:
+                U_pp = energy_func(q_pp, params)
+                U_pm = energy_func(q_pm, params)
+                U_mp = energy_func(q_mp, params)
+                U_mm = energy_func(q_mm, params)
+
+            hessian[i, j] = (U_pp - U_pm - U_mp + U_mm) / (4 * epsilon**2)
+            if i != j:
+                hessian[j, i] = hessian[i, j] # 对称填充
+    return hessian
+
+def calculate_hessian_analytical(q, tensions, params):
+    """
+    【海森矩阵-混合解析法】
+    [V-Final.2] 采用数值法替换已被证明有Bug的H_A和H_G解析公式，保证数学正确性。
+    """
+    # --- 1. 计算弹性势能的解析海森矩阵 H_E (已验证正确) ---
+    H_E = calculate_elastic_hessian_analytical(q, params)
+
+    # --- 2. 用高精度数值法计算驱动势能的海森矩阵 H_A ---
+    H_A = calculate_hessian_numerical_high_precision(
+        q, calculate_actuation_potential_energy, params, tensions=tensions, epsilon=1e-5
+    )
+
+    # --- 3. 用高精度数值法计算重力势能的海森矩阵 H_G ---
+    H_G = calculate_hessian_numerical_high_precision(
+        q, calculate_gravity_potential_energy, params, epsilon=1e-5
+    )
+
+    # --- 4. 返回总海森矩阵 ---
+    return H_E + H_A + H_G
+
+def calculate_elastic_hessian_analytical(q, params):
+    """
+    [V-Final] 计算最终版弹性势能 U_elastic 的解析海森矩阵。
+    """
+    Lp, kp, phip, kc1, phic1, kc2, phic2 = q
+    geo = params['Geometry']
+    stiff = params['Stiffness']
+    Lc1 = geo['CMS_proximal_length']
+    Lc2 = geo['CMS_distal_length']
+
+    # 从config加载新的刚度参数
+    k_axial_pss = stiff['pss_equivalent_axial_stiffness']
+    EI_bend_pss = stiff['pss_total_equivalent_bending_stiffness']
+    EI_bend_cms = stiff['cms_bending_stiffness']
+
+    H_E = np.zeros((7, 7))
+
+    # 计算非零元素
+    H_E[0, 0] = k_axial_pss
+    H_E[0, 1] = EI_bend_pss * kp
+    H_E[1, 0] = EI_bend_pss * kp  # Symmetric
+    H_E[1, 1] = EI_bend_pss * Lp
+    H_E[3, 3] = EI_bend_cms * Lc1
+    H_E[5, 5] = EI_bend_cms * Lc2
+
+    # 物理约束惩罚项的海森矩阵
+    if Lp < 0:
+        H_E[0, 0] += 2 * 1e6
+
+    return H_E
+
+
+if __name__ == '__main__':
+    print("--- 静力学模块功能自检 ---")
+    import json
+    from src.utils.read_config import load_config
+    config_params = load_config('config/config.json')
+    print("成功加载 'config.json' 中的参数。 সন")
+
+    np.set_printoptions(precision=6, suppress=True)
+    
+    # --- 梯度对比测试 ---
+    print("\n--- 梯度对比 (随机10组) ---")
+    max_grad_diff = 0
+    for i in range(10):
+        q_test = np.random.rand(7)
+        q_test[0] = 0.1 + np.random.rand() * 0.05
+        q_test[1::2] *= np.pi * 2
+        q_test[2::2] *= 2.0
+        tensions_test = {
+            'tensions_short': np.random.rand(4) * 20,
+            'tensions_long': np.random.rand(4) * 20
+        }
+        grad_numerical = calculate_gradient(q_test, tensions_test, config_params, epsilon=1e-5)
+        grad_analytical = calculate_gradient_analytical(q_test, tensions_test, config_params)
+        diff_norm = np.linalg.norm(grad_numerical - grad_analytical)
+        if diff_norm > max_grad_diff:
+            max_grad_diff = diff_norm
+        print(f"  - 测试组 {i+1}: 差值范数 = {diff_norm:.8f}")
+
+    # --- 驱动雅可比对比测试 ---
+    print("\n--- 驱动雅可比对比 (随机10组) ---")
+    max_jac_diff = 0
+    for i in range(10):
+        q_test = np.random.rand(7)
+        q_test[0] = 0.1 + np.random.rand() * 0.05
+        q_test[1::2] *= np.pi * 2
+        q_test[2::2] *= 2.0
+        
+        J_analytical = calculate_actuation_jacobian_analytical(q_test, config_params)
+        J_numerical = calculate_actuation_jacobian_numerical(q_test, config_params, epsilon=1e-6)
+        diff_norm = np.linalg.norm(J_analytical - J_numerical)
+        if diff_norm > max_jac_diff:
+            max_jac_diff = diff_norm
+        print(f"  - 测试组 {i+1}: 差值范数 = {diff_norm:.8f}")
+
+    # --- 海森矩阵对比测试 ---
+    print("\n--- 海森矩阵对比 (随机5组) ---")
+    max_hess_diff = 0
+    for i in range(5):
+        q_test = np.random.rand(7)
+        q_test[0] = 0.1 + np.random.rand() * 0.05
+        q_test[1::2] *= np.pi * 2
+        q_test[2::2] *= 2.0
+        tensions_test = {
+            'tensions_short': np.random.rand(4) * 100.0,
+            'tensions_long': np.random.rand(4) * 100.0
+        }
+        
+        H_analytical = calculate_hessian_analytical(q_test, tensions_test, config_params)
+        H_numerical = calculate_hessian(q_test, tensions_test, config_params, epsilon=1e-4)
+        diff_norm = np.linalg.norm(H_analytical - H_numerical)
+        if diff_norm > max_hess_diff:
+            max_hess_diff = diff_norm
+        print(f"  - 测试组 {i+1}: 差值范数 = {diff_norm:.8f}")
+
+    # --- 结论 ---
+    print("\n--------------------------------------------")
+    print(f"[梯度测试结论] 最大差值范数为: {max_grad_diff:.8f}")
+    if max_grad_diff < 1e-4:
+        print("  - 测试通过：混合解析梯度与数值总梯度高度一致。 সন")
+    else:
+        print("  - 测试失败：梯度计算存在显著差异。")
+    
+    print(f"\n[雅可比测试结论] 最大差值范数为: {max_jac_diff:.8f}")
+    if max_jac_diff < 1e-6:
+        print("  - 测试通过：解析雅可比与数值雅可比高度一致。 ")
+    else:
+        print("  - 测试失败：雅可比计算存在显著差异。")
+
+    print(f"\n[海森矩阵测试结论] 最大差值范数为: {max_hess_diff:.8f}")
+    if max_hess_diff < 1e-2: # Use a looser tolerance for the complex Hessian
+        print("  - 测试通过：混合解析海森矩阵与数值海森矩阵基本一致。 ")
+    else:
+        print("  - 测试失败：海森矩阵计算存在显著差异。")
+    print("--------------------------------------------")
+    print("\n--- 自检完成 ---")
+
+def calculate_hessian_numerical_high_precision(q, energy_func, params, tensions=None, epsilon=1e-5):
+    """
+    高精度数值海森矩阵计算 (二阶中心差分)。
+    """
+    hessian = np.zeros((7, 7))
+    for i in range(7):
+        for j in range(i, 7): # 利用对称性，只计算上三角部分
+            q_pp = q.copy(); q_pp[i] += epsilon; q_pp[j] += epsilon
+            q_pm = q.copy(); q_pm[i] += epsilon; q_pm[j] -= epsilon
+            q_mp = q.copy(); q_mp[i] -= epsilon; q_mp[j] += epsilon
+            q_mm = q.copy(); q_mm[i] -= epsilon; q_mm[j] -= epsilon
+
+            if tensions:
+                U_pp = energy_func(q_pp, tensions, params)
+                U_pm = energy_func(q_pm, tensions, params)
+                U_mp = energy_func(q_mp, tensions, params)
+                U_mm = energy_func(q_mm, tensions, params)
+            else:
+                U_pp = energy_func(q_pp, params)
+                U_pm = energy_func(q_pm, params)
+                U_mp = energy_func(q_mp, params)
+                U_mm = energy_func(q_mm, params)
+
+            hessian[i, j] = (U_pp - U_pm - U_mp + U_mm) / (4 * epsilon**2)
+            if i != j:
+                hessian[j, i] = hessian[i, j] # 对称填充
+    return hessian

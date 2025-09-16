@@ -1,0 +1,31 @@
+{
+    "Geometry": {
+        "PSS_initial_length": 0.2,
+        "CMS_proximal_length": 0.050,
+        "CMS_distal_length": 0.050,
+        "short_lines": {
+            "diameter_m": 0.005,
+            "angles_deg": [0, 90, 180, 270]
+        },
+        "long_lines": {
+            "diameter_m": 0.007,
+            "angles_deg": [45, 135, 225, 315]
+        }
+    },
+    "Mass": {
+        "g": 9.80665,
+        "pss_kg": 0.01,
+        "cms_proximal_kg": 0.005,
+        "cms_distal_kg": 0.005
+    },
+    "Stiffness": {
+        "pss_equivalent_axial_stiffness": 100.0,
+        "pss_total_equivalent_bending_stiffness": 0.01,
+        "cms_bending_stiffness": 0.002
+    },
+    "Initial_State": {
+        "q0": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "tensions_short": [0.0, 0.0, 0.0, 0.0],
+        "tensions_long": [0.0, 0.0, 0.0, 0.0]
+    }
+}

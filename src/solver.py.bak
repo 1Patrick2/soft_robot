@@ -1,0 +1,121 @@
+# src/solver.py
+
+import numpy as np
+from scipy.optimize import minimize
+import sys
+import os
+import logging
+
+# --- 核心依赖 ---
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.statics import (
+    calculate_total_potential_energy_disp_ctrl,
+    calculate_gradient_disp_ctrl
+)
+from src.utils.read_config import load_config
+
+# =====================================================================
+# === 内循环求解器 (位移控) - [V-Final.Phoenix]
+# =====================================================================
+
+def solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params):
+    """
+    [V-Final.Phoenix] 回归无约束优化，最小化包含缆绳弹性势能的总能量。
+    使用L-BFGS-B算法，其稳定性将由外层修正后的物理参数保证。
+    """
+    
+    # 定义一个调试回调函数，用于打印每一步的状态
+    def debug_callback(xk):
+        energy = objective_function(xk)
+        grad = jacobian_function(xk)
+        grad_norm = np.linalg.norm(grad)
+        # 使用logging而不是print，以便更好地控制输出
+        logging.info(f"  [Iter] q: {xk}, Energy: {energy:.6e}, Grad Norm: {grad_norm:.6e}")
+
+    objective_function = lambda q: calculate_total_potential_energy_disp_ctrl(q, delta_l_motor, params)
+    jacobian_function = lambda q: calculate_gradient_disp_ctrl(q, delta_l_motor, params)
+
+    bounds = [(-40, 40), (-np.inf, np.inf)] * 3
+
+    result = minimize(
+        objective_function, 
+        q_guess, 
+        method='L-BFGS-B',
+        jac=jacobian_function, 
+        bounds=bounds,
+        options={'ftol': 1e-9, 'gtol': 1e-7, 'maxiter': 500, 'maxls': 10, 'eps': 1e-6},
+        callback=debug_callback  # <-- [核心修改] 增加调试探针
+    )
+
+    if result.success and not np.any(np.isnan(result.x)):
+        return result.x
+    else:
+        # 在失败时也打印更详细的信息
+        logging.warning(f"[Solver] L-BFGS-B failed to converge. Full result object:\n{result}")
+        return None
+
+
+# =====================================================================
+# === 自检模块 - [第一性原理审计：第二阶段]
+# =====================================================================
+
+if __name__ == '__main__':
+    # 配置日志记录
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+    print("--- 求解器思想实验 (零重力、零驱动) ---")
+    config = load_config('config/config.json')
+    np.set_printoptions(precision=6, suppress=True)
+
+    # 1. 创建一个“零重力”的环境
+    config['Mass']['pss_kg'] = 0
+    config['Mass']['cms_proximal_kg'] = 0
+    config['Mass']['cms_distal_kg'] = 0
+    print("已设置场景: 零重力, 零驱动电机位移")
+
+    # 2. 定义“真理”：在这种情况下，唯一的能量最低点是 q = 0
+    q_truth = np.zeros(6)
+    delta_l_zero = np.zeros(8)
+
+    # 3. 从一个固定的、极小的非零初始点开始，以避免奇点
+    q_guess_perturbed = np.full(6, 1e-6)
+    print(f"初始猜测构型 (含扰动): {q_guess_perturbed}")
+
+    # 4. 执行求解
+    q_eq_disp = solve_static_equilibrium_disp_ctrl(q_guess_perturbed, delta_l_zero, config)
+
+    # 5. 验证结果
+    if q_eq_disp is not None:
+        print(f"✅ 求解成功. 平衡构型 q_eq: {q_eq_disp}")
+        if np.allclose(q_eq_disp, q_truth, atol=1e-3): # 使用一个工程上合理的容差
+            print("  - ✅✅✅ 【最终验证通过】: 求解器成功收敛到理论真值附近！")
+        else:
+            print(f"  - ⚠️  【最终验证警告】: 求解器收敛，但与理论真值存在微小偏差。")
+    else:
+        print("❌ 求解失败.")
+
+    print("\n" + "="*50)
+    print("--- 求解器随机点压力测试 (有重力、随机驱动) ---")
+    
+    # 重新加载包含重力的配置
+    config_gravity = load_config('config/config.json')
+    
+    # 生成随机驱动和随机猜测点
+    # 假设电机最大位移为2mm
+    delta_l_motor_random = np.random.rand(8) * 0.002 
+    # 在一个合理的范围内随机猜测q
+    q_guess_random = np.random.rand(6) * np.array([1, 2*np.pi, 1, 2*np.pi, 1, 2*np.pi]) - np.array([0.5, np.pi, 0.5, np.pi, 0.5, np.pi])
+
+    print(f"测试条件: 有重力")
+    print(f"  - 随机电机位移 Δl_motor: {delta_l_motor_random}")
+    print(f"  - 随机初始猜测 q_guess: {q_guess_random}")
+
+    # 执行求解
+    q_eq_random = solve_static_equilibrium_disp_ctrl(q_guess_random, delta_l_motor_random, config_gravity)
+
+    # 验证结果
+    if q_eq_random is not None:
+        print(f"✅ 【压力测试通过】: 求解器在随机点上成功收敛。")
+        print(f"  - 平衡构型 q_eq: {q_eq_random}")
+    else:
+        print(f"❌ 【压力测试失败】: 求解器在随机点上未能收敛。")

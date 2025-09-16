@@ -1,0 +1,250 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import sys
+import os
+from tqdm import tqdm
+import time
+
+# 将项目根目录添加到Python路径中
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 假设项目结构允许这样导入
+from src.outer_solver import solve_inverse_kinematics, calculate_pose_error, calculate_task_jacobian
+from src.kinematics import forward_kinematics
+from src.solver import solve_static_equilibrium
+from src.utils.read_config import load_config
+
+def generate_circular_path(radius, num_points, center_x, center_y, center_z):
+    """
+    在 xy 平面上生成一个圆形路径，z 高度固定。
+    返回一个姿态矩阵的列表。
+    """
+    print("正在生成圆形路径...")
+    path_points = []
+    angles = np.linspace(0, 2 * np.pi, num_points)
+
+    for angle in angles:
+        x = center_x + radius * np.cos(angle)
+        y = center_y + radius * np.sin(angle)
+        z = center_z
+        
+        target_pose = np.array([
+            [1, 0, 0, x],
+            [0, 1, 0, y],
+            [0, 0, 1, z],
+            [0, 0, 0, 1]
+        ])
+        path_points.append(target_pose)
+    
+    print(f"成功生成包含 {len(path_points)} 个点的路径。")
+    return path_points
+
+def plot_results(target_path, actual_path, forces, title_suffix=""):
+    """
+    可视化仿真结果，包括三视图、力曲线和带颜色渐变的路径。
+    """
+    print("\n正在绘制结果图...")
+    
+    # 1. 绘制驱动力曲线
+    plt.figure(figsize=(15, 7))
+    forces_array = np.array(forces)
+    for i in range(forces_array.shape[1]):
+        plt.plot(forces_array[:, i], label=f'τ_{{i+1}}')
+    plt.title(f'Driving Forces vs. Path Points {title_suffix}')
+    plt.xlabel('Path Point Index')
+    plt.ylabel('Force (N)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"plots/forces_plot{title_suffix}.png")
+    print(f"Forces plot saved to plots/forces_plot{title_suffix}.png")
+    plt.close()
+
+    # 2. 创建三视图和3D路径对比图
+    fig = plt.figure(figsize=(12, 12))
+    fig.suptitle(f'Path Tracking Analysis {title_suffix}', fontsize=16)
+
+    target_x = [p[0, 3] for p in target_path]
+    target_y = [p[1, 3] for p in target_path]
+    target_z = [p[2, 3] for p in target_path]
+    actual_x = [p[0, 3] for p in actual_path]
+    actual_y = [p[1, 3] for p in actual_path]
+    actual_z = [p[2, 3] for p in actual_path]
+
+    num_points = len(actual_x)
+    colors = plt.cm.viridis(np.linspace(0, 1, num_points))
+
+    # --- 3D View ---
+    ax3d = fig.add_subplot(2, 2, 1, projection='3d')
+    ax3d.plot(target_x, target_y, target_z, 'r--', label='Target Path', alpha=0.7, linewidth=2)
+    ax3d.plot(actual_x, actual_y, actual_z, '-', color='deepskyblue', alpha=0.8, label='Actual Path')
+    ax3d.scatter(actual_x, actual_y, actual_z, c=colors, s=25, zorder=5)
+    ax3d.scatter(actual_x[0], actual_y[0], actual_z[0], c='lime', s=100, ec='black', zorder=10, label='Start')
+    ax3d.set_title('3D View')
+    ax3d.set_xlabel('X (m)'); ax3d.set_ylabel('Y (m)'); ax3d.set_zlabel('Z (m)')
+    ax3d.legend()
+    ax3d.axis('equal')
+
+    # --- 2D Views ---
+    views = [
+        (fig.add_subplot(2, 2, 2), (target_x, target_y), (actual_x, actual_y), 'XY Plane', 'X (m)', 'Y (m)'),
+        (fig.add_subplot(2, 2, 3), (target_x, target_z), (actual_x, actual_z), 'XZ Plane', 'X (m)', 'Z (m)'),
+        (fig.add_subplot(2, 2, 4), (target_y, target_z), (actual_y, actual_z), 'YZ Plane', 'Y (m)', 'Z (m)')
+    ]
+
+    for ax, target_coords, actual_coords, title, xlabel, ylabel in views:
+        ax.plot(target_coords[0], target_coords[1], 'r--', alpha=0.7, linewidth=2, label='Target')
+        ax.plot(actual_coords[0], actual_coords[1], '-', color='deepskyblue', alpha=0.8, label='Actual Path')
+        ax.scatter(actual_coords[0], actual_coords[1], c=colors, s=25, zorder=5)
+        ax.scatter(actual_coords[0][0], actual_coords[1][0], c='lime', s=100, ec='black', zorder=10, label='Start')
+        ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        ax.grid(True); ax.axis('equal'); ax.legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(f"plots/path_plot_3_view{title_suffix}.png")
+    print(f"3-view path plot saved to plots/path_plot_3_view{title_suffix}.png")
+    plt.close()
+
+def track_path_task_space(target_poses, config):
+    """
+    [OPTIMIZED] 使用预测-校正法在任务空间(SE3)中进行路径跟踪。
+    """
+    print("\n--- 开始任务空间 (Task-space) 跟踪 [预测-校正法] ---")
+    start_time = time.time()
+
+    actual_poses = []
+    required_forces = []
+    
+    # 初始化状态变量
+    q_prev = np.array(config['Initial_State']['q0'])
+    tau_prev_dict = {
+        'tensions_short': np.full(4, 1.0), # 使用一个小的非零张力开始
+        'tensions_long': np.full(4, 1.0)
+    }
+    tau_prev_flat = np.concatenate(list(tau_prev_dict.values()))
+
+    for i, target_pose in enumerate(tqdm(target_poses, desc="Tracking in Task-space")):
+        if i == 0:
+            # 对于第一个点，进行一次完整的IK求解以获得初始状态
+            ik_result = solve_inverse_kinematics(
+                T_target=target_pose,
+                initial_tau_guess=tau_prev_dict,
+                q_guess=q_prev,
+                params=config,
+                smoothing_weight=1e-7 # 对第一点使用较小的平滑权重
+            )
+        else:
+            # --- 预测-校正 --- #
+            # 1. 在上一个精确解(q_prev)处计算任务雅可比
+            J_task = calculate_task_jacobian(tau_prev_dict, q_prev, config)
+            
+            # 2. 计算从上一个实际位姿到当前目标位姿所需的位姿变化 (twist)
+            T_prev = actual_poses[-1]
+            delta_twist = calculate_pose_error(target_pose, T_prev)
+            
+            # 3. 预测驱动力增量 delta_tau
+            # 使用最小二乘法求解线性方程 J_task * delta_tau = delta_twist
+            delta_tau, _, _, _ = np.linalg.lstsq(J_task, delta_twist, rcond=None)
+            
+            # 4. 得到预测的驱动力，并施加边界约束
+            tau_predict_flat = tau_prev_flat + delta_tau
+            tau_predict_flat = np.clip(tau_predict_flat, 0, 100) # 强制执行力的边界
+            
+            tau_predict_dict = {
+                'tensions_short': tau_predict_flat[:4],
+                'tensions_long': tau_predict_flat[4:]
+            }
+
+            # 5. 校正：使用高质量的预测值作为热启动进行IK求解
+            ik_result = solve_inverse_kinematics(
+                T_target=target_pose,
+                initial_tau_guess=tau_predict_dict,
+                q_guess=q_prev, # 使用上一步的q作为构型猜测
+                params=config,
+                previous_tau=tau_prev_dict,
+                smoothing_weight=5e-6 # 使用常规的平滑权重
+            )
+
+        # --- 处理IK结果 ---
+        if ik_result.success and ik_result.q_solution is not None:
+            tau_final_flat = ik_result.x
+            q_solution = ik_result.q_solution
+
+            # 更新状态以备下一步预测使用
+            q_prev = q_solution
+            tau_prev_flat = tau_final_flat
+            tau_prev_dict = {'tensions_short': tau_final_flat[:4], 'tensions_long': tau_final_flat[4:]}
+            
+            required_forces.append(tau_final_flat)
+            actual_pose, _ = forward_kinematics(q_solution, config)
+            actual_poses.append(actual_pose)
+        else:
+            # 如果求解失败，重复上一个姿态以保持路径长度
+            if actual_poses:
+                actual_poses.append(actual_poses[-1])
+                required_forces.append(required_forces[-1])
+            # 如果第一次就失败，需要一个初始姿态
+            elif i == 0:
+                initial_pose, _ = forward_kinematics(q_prev, config)
+                actual_poses.append(initial_pose)
+                required_forces.append(tau_prev_flat)
+
+    end_time = time.time()
+    print(f"Task-space 跟踪完成，耗时: {end_time - start_time:.2f} 秒")
+
+    return actual_poses, required_forces, "_task_space_predictor_corrector"
+
+
+def main():
+    """
+    路径跟踪仿真主函数。
+    """
+    print("开始路径跟踪仿真...")
+
+    # 1. 加载配置和工作空间数据
+    config = load_config('config/config.json')
+    workspace_data_path = 'plots/workspace_points.npy'
+    if not os.path.exists(workspace_data_path):
+        print(f"错误: 工作空间数据文件未找到: {workspace_data_path}")
+        print("请先运行 analysis/workspace_analysis.py 来生成数据。")
+        return
+
+    workspace_points = np.load(workspace_data_path)
+    
+    # 2. 基于工作空间数据，计算一个保守的目标路径
+    center_x = np.mean(workspace_points[:, 0])
+    center_y = np.mean(workspace_points[:, 1])
+    center_z = np.mean(workspace_points[:, 2])
+    
+    radius = 0.4 * min(np.std(workspace_points[:, 0]), np.std(workspace_points[:, 1]))
+
+    print("\n--- 基于工作空间数据的路径参数 ---")
+    print(f"中心点 (X, Y, Z): ({center_x:.4f}, {center_y:.4f}, {center_z:.4f}) m")
+    print(f"半径: {radius:.4f} m")
+    print("------------------------------------")
+
+    if radius < 0.001:
+        print(f"错误: 计算出的路径半径 ({radius:.4f} m) 过小。")
+        return
+
+    target_poses = generate_circular_path(
+        radius=radius, 
+        num_points=50,
+        center_x=center_x, 
+        center_y=center_y, 
+        center_z=center_z
+    )
+
+    actual_poses, required_forces, suffix = track_path_task_space(target_poses, config)
+
+    print("\n--- 仿真循环结束 ---")
+
+    if actual_poses:
+        plot_results(target_poses[:len(actual_poses)], actual_poses, required_forces, title_suffix=suffix)
+    else:
+        print("没有成功求解的路径点，无法生成结果图。")
+
+    print("路径跟踪仿真结束。")
+
+
+if __name__ == "__main__":
+    main()

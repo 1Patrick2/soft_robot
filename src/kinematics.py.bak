@@ -1,0 +1,410 @@
+import numpy as np
+import sys
+import os
+
+# [路径修正] 将项目根目录添加到Python路径中
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# [路径修正] 使用绝对路径导入
+from src.utils.debug_config import DEBUG_SINGLE_SEGMENT
+
+# [V-Final] 增加一个全局极小值，用于安全除法，防止kappa接近零时数值不稳定
+EPSILON = 1e-9
+
+def pcc_transformation(kappa, phi, L):
+    """
+    计算单个PCC段的齐次变换矩阵.
+    """
+    if np.isclose(kappa, 0):
+        T = np.identity(4)
+        T[2, 3] = L
+    else:
+        # [V-Final] 使用安全除法
+        kappa_safe = kappa + EPSILON
+        c_phi, s_phi = np.cos(phi), np.sin(phi)
+        c_kL, s_kL = np.cos(kappa * L), np.sin(kappa * L)
+        T = np.array([
+            [c_phi**2 * (c_kL - 1) + 1, s_phi * c_phi * (c_kL - 1), c_phi * s_kL, c_phi * (1 - c_kL) / kappa_safe],
+            [s_phi * c_phi * (c_kL - 1), s_phi**2 * (c_kL - 1) + 1, s_phi * s_kL, s_phi * (1 - c_kL) / kappa_safe],
+            [-c_phi * s_kL, -s_phi * s_kL, c_kL, s_kL / kappa_safe],
+            [0, 0, 0, 1]
+        ])
+
+        # Health check for the rotation matrix
+        R = T[:3, :3]
+        det_R = np.linalg.det(R)
+        if not np.isclose(det_R, 1.0):
+            print(f"\n--- WARNING: Invalid Rotation Matrix in pcc_transformation ---")
+            print(f"Input (kappa, phi, L): ({kappa:.4f}, {phi:.4f}, {L:.4f})")
+            print(f"Determinant: {det_R:.6f}")
+            # print(f"Rotation Matrix:\n{R}")
+            print("-----------------------------------------------------------")
+    return T
+
+def get_segment_com_local(kappa, L):
+    """
+    [V-Final.6] 终极混合修复：恢复了对kappa=0的条件判断，并为else分支增加了Epsilon保险丝.
+    """
+    if np.isclose(L, 0):
+        return np.array([0, 0, 0])
+
+    if np.isclose(kappa, 0):
+        return np.array([0, 0, L / 2.0])
+    else:
+        kL = kappa * L
+        # 使用带保险丝的公式，避免在kappa极小但非零时出现数值问题
+        com_x = (kL - np.sin(kL)) / (L * kappa**2 + EPSILON)
+        com_z = (1 - np.cos(kL)) / (L * kappa**2 + EPSILON)
+        return np.array([com_x, 0, com_z])
+
+def forward_kinematics(q, robot_params):
+    """
+    计算整个三段式机器人的正运动学。
+    [V2 修正] 使用精确的解析公式计算质心，替换掉错误的简化近似。
+    """
+    L_p, kappa_p, phi_p, kappa_c1, phi_c1, kappa_c2, phi_c2 = q
+    L_c1 = robot_params['Geometry']['CMS_proximal_length']
+    L_c2 = robot_params['Geometry']['CMS_distal_length']
+
+    # 1. 计算各段的变换矩阵
+    T_pss = pcc_transformation(kappa_p, phi_p, L_p)
+    T_cms1 = pcc_transformation(kappa_c1, phi_c1, L_c1)
+    T_cms2 = pcc_transformation(kappa_c2, phi_c2, L_c2)
+
+    T_final = T_pss @ T_cms1 @ T_cms2
+
+    # 2. [修正] 精确计算各段质心在世界坐标系下的位置
+    # 首先，计算各段在其局部坐标系下的质心
+    com_pss_local = get_segment_com_local(kappa_p, L_p)
+    com_cms1_local = get_segment_com_local(kappa_c1, L_c1)
+    com_cms2_local = get_segment_com_local(kappa_c2, L_c2)
+
+    # 然后，将局部质心坐标旋转到正确的弯曲平面
+    R_pss = np.array([[np.cos(phi_p), -np.sin(phi_p), 0], [np.sin(phi_p), np.cos(phi_p), 0], [0, 0, 1]])
+    R_cms1 = np.array([[np.cos(phi_c1), -np.sin(phi_c1), 0], [np.sin(phi_c1), np.cos(phi_c1), 0], [0, 0, 1]])
+    R_cms2 = np.array([[np.cos(phi_c2), -np.sin(phi_c2), 0], [np.sin(phi_c2), np.cos(phi_c2), 0], [0, 0, 1]])
+
+    com_pss_rotated = R_pss @ com_pss_local
+    com_cms1_rotated = R_cms1 @ com_cms1_local
+    com_cms2_rotated = R_cms2 @ com_cms2_local
+
+    # 最后，将旋转后的局部质心变换到世界坐标系
+    com_pss_world = com_pss_rotated
+    com_cms1_world = T_pss[:3, :3] @ com_cms1_rotated + T_pss[:3, 3]
+    T_base_cms2 = T_pss @ T_cms1
+    com_cms2_world = T_base_cms2[:3, :3] @ com_cms2_rotated + T_base_cms2[:3, 3]
+
+    com_positions = {
+        'pss': com_pss_world,
+        'cms1': com_cms1_world,
+        'cms2': com_cms2_world
+    }
+
+    return T_final, com_positions
+
+def pcc_derivatives_analytical(kappa, phi, L):
+    """
+    [V-Final] 增加安全除法. 
+    计算单个PCC段变换矩阵对于其参数(L, kappa, phi)的解析偏导数矩阵。
+    返回一个包含三个4x4矩阵的元组 (dT/dL, dT/dkappa, dT/dphi)。
+    """
+    dT_dL = np.zeros((4, 4))
+    dT_dkappa = np.zeros((4, 4))
+    dT_dphi = np.zeros((4, 4))
+
+    c_phi, s_phi = np.cos(phi), np.sin(phi)
+
+    if np.isclose(kappa, 0):
+        dT_dL[2, 3] = 1
+        # d/dkappa 和 d/dphi 在 kappa=0 时为0 (或需要用极限处理，这里简化为0)
+    else:
+        # [V-Final] 使用安全除法
+        kappa_safe = kappa + EPSILON
+        c_kL, s_kL = np.cos(kappa * L), np.sin(kappa * L)
+
+        # --- dT/dL ---
+        dT_dL[0, 0] = c_phi**2 * (-kappa * s_kL)
+        dT_dL[0, 1] = s_phi * c_phi * (-kappa * s_kL)
+        dT_dL[0, 2] = c_phi * kappa * c_kL
+        dT_dL[0, 3] = c_phi * s_kL
+        dT_dL[1, 0] = dT_dL[0, 1]
+        dT_dL[1, 1] = s_phi**2 * (-kappa * s_kL)
+        dT_dL[1, 2] = s_phi * kappa * c_kL
+        dT_dL[1, 3] = s_phi * s_kL
+        dT_dL[2, 0] = -c_phi * kappa * c_kL
+        dT_dL[2, 1] = -s_phi * kappa * c_kL
+        dT_dL[2, 2] = -kappa * s_kL
+        dT_dL[2, 3] = c_kL
+
+        # --- dT/dkappa ---
+        term1 = (L * s_kL * kappa - (1 - c_kL)) / (kappa_safe**2)
+        dT_dkappa[0, 0] = c_phi**2 * (-L * s_kL)
+        dT_dkappa[0, 1] = s_phi * c_phi * (-L * s_kL)
+        dT_dkappa[0, 2] = c_phi * L * c_kL
+        dT_dkappa[0, 3] = c_phi * term1
+        dT_dkappa[1, 0] = dT_dkappa[0, 1]
+        dT_dkappa[1, 1] = s_phi**2 * (-L * s_kL)
+        dT_dkappa[1, 2] = s_phi * L * c_kL
+        dT_dkappa[1, 3] = s_phi * term1
+        dT_dkappa[2, 0] = -c_phi * L * c_kL
+        dT_dkappa[2, 1] = -s_phi * L * c_kL
+        dT_dkappa[2, 2] = -L * s_kL
+        dT_dkappa[2, 3] = (c_kL * kappa * L - s_kL) / (kappa_safe**2)
+
+        # --- dT/dphi ---
+        term2 = c_kL - 1
+        dT_dphi[0, 0] = 2 * c_phi * -s_phi * term2
+        dT_dphi[0, 1] = (c_phi**2 - s_phi**2) * term2
+        dT_dphi[0, 2] = -s_phi * s_kL
+        dT_dphi[0, 3] = -s_phi * (1 - c_kL) / kappa_safe
+        dT_dphi[1, 0] = dT_dphi[0, 1]
+        dT_dphi[1, 1] = 2 * s_phi * c_phi * term2
+        dT_dphi[1, 2] = c_phi * s_kL
+        dT_dphi[1, 3] = c_phi * (1 - c_kL) / kappa_safe
+        dT_dphi[2, 0] = s_phi * s_kL
+        dT_dphi[2, 1] = -c_phi * s_kL
+        # d(c_kL)/dphi = 0, d(s_kL/kappa)/dphi = 0
+
+    return dT_dL, dT_dkappa, dT_dphi
+
+def calculate_kinematic_jacobian_analytical(q, params):
+    """
+    【运动学雅可比-解析法】
+    """
+    J_kin = np.zeros((6, 7))
+    L_p, kappa_p, phi_p, kappa_c1, phi_c1, kappa_c2, phi_c2 = q
+    L_c1 = params['Geometry']['CMS_proximal_length']
+    L_c2 = params['Geometry']['CMS_distal_length']
+
+    # 1. 计算各段的变换矩阵和偏导数矩阵
+    T_pss = pcc_transformation(kappa_p, phi_p, L_p)
+    T_cms1 = pcc_transformation(kappa_c1, phi_c1, L_c1)
+    T_cms2 = pcc_transformation(kappa_c2, phi_c2, L_c2)
+
+    dT_pss_dLp, dT_pss_dkp, dT_pss_dphip = pcc_derivatives_analytical(kappa_p, phi_p, L_p)
+    _, dT_cms1_dkc1, dT_cms1_dphic1 = pcc_derivatives_analytical(kappa_c1, phi_c1, L_c1)
+    _, dT_cms2_dkc2, dT_cms2_dphic2 = pcc_derivatives_analytical(kappa_c2, phi_c2, L_c2)
+
+    # 2. 计算总变换矩阵对各q分量的偏导数 (链式法则)
+    T_f = T_pss @ T_cms1 @ T_cms2
+    R_f = T_f[:3, :3]
+
+    # 映射 d(T)/dq -> 6D twist (velocity vector)
+    def get_twist(dT, R_base):
+        dp = dT[:3, 3]
+        dR = dT[:3, :3]
+        S = dR @ R_base.T # Skew-symmetric matrix
+        omega = np.array([S[2, 1], S[0, 2], S[1, 0]])
+        return np.concatenate([dp, omega])
+
+    # --- 逐列计算雅可比 ---
+    # PSS段参数 (影响后续所有段)
+    J_kin[:, 0] = get_twist(dT_pss_dLp @ T_cms1 @ T_cms2, R_f)
+    J_kin[:, 1] = get_twist(dT_pss_dkp @ T_cms1 @ T_cms2, R_f)
+    J_kin[:, 2] = get_twist(dT_pss_dphip @ T_cms1 @ T_cms2, R_f)
+    # CMS1段参数
+    J_kin[:, 3] = get_twist(T_pss @ dT_cms1_dkc1 @ T_cms2, R_f)
+    J_kin[:, 4] = get_twist(T_pss @ dT_cms1_dphic1 @ T_cms2, R_f)
+    # CMS2段参数
+    J_kin[:, 5] = get_twist(T_pss @ T_cms1 @ dT_cms2_dkc2, R_f)
+    J_kin[:, 6] = get_twist(T_pss @ T_cms1 @ dT_cms2_dphic2, R_f)
+
+    return J_kin
+
+def calculate_com_jacobians_analytical(q, params):
+    """
+    [V-Ghost-Busted-Final] 修正了质心雅可比计算中链式法则的最终实现。
+    [新增] 计算三段质心相对于构型q的雅可比矩阵。
+    返回一个字典，包含三个雅可比矩阵 J_com_pss, J_com_cms1, J_com_cms2。
+    每个雅可比矩阵都是 3x7 的，行代表质心的(x,y,z)坐标，列代表7个构型变量q。
+    """
+    # 拆分构型向量和参数
+    L_p, kappa_p, phi_p, kappa_c1, phi_c1, kappa_c2, phi_c2 = q
+    L_c1 = params['Geometry']['CMS_proximal_length']
+    L_c2 = params['Geometry']['CMS_distal_length']
+
+    q_pss_tuple = (L_p, kappa_p, phi_p)
+    q_cms1_tuple = (L_c1, kappa_c1, phi_c1)
+    q_cms2_tuple = (L_c2, kappa_c2, phi_c2)
+
+    # 预计算各段的变换矩阵
+    T_pss = pcc_transformation(kappa_p, phi_p, L_p)
+    T_cms1 = pcc_transformation(kappa_c1, phi_c1, L_c1)
+    T_base_cms2 = T_pss @ T_cms1
+
+    # 预计算各段变换矩阵对各自参数的偏导数
+    dT_pss_dLp, dT_pss_dkp, dT_pss_dphip = pcc_derivatives_analytical(kappa_p, phi_p, L_p)
+    _, dT_cms1_dkc1, dT_cms1_dphic1 = pcc_derivatives_analytical(kappa_c1, phi_c1, L_c1)
+    
+    # 预计算各段质心对各自参数(L, kappa)的偏导数
+    dcom_pss_dLp, dcom_pss_dkp, _ = [pcc_com_derivatives(q_pss_tuple, i) for i in range(3)]
+    _, dcom_cms1_dkc1, _ = [pcc_com_derivatives(q_cms1_tuple, i) for i in range(3)]
+    _, dcom_cms2_dkc2, _ = [pcc_com_derivatives(q_cms2_tuple, i) for i in range(3)]
+
+    # 预计算局部坐标系下的质心和旋转矩阵
+    com_pss_local = get_segment_com_local(kappa_p, L_p)
+    com_cms1_local = get_segment_com_local(kappa_c1, L_c1)
+    com_cms2_local = get_segment_com_local(kappa_c2, L_c2)
+
+    R_pss_z = np.array([[np.cos(phi_p), -np.sin(phi_p), 0], [np.sin(phi_p), np.cos(phi_p), 0], [0, 0, 1]])
+    R_cms1_z = np.array([[np.cos(phi_c1), -np.sin(phi_c1), 0], [np.sin(phi_c1), np.cos(phi_c1), 0], [0, 0, 1]])
+    R_cms2_z = np.array([[np.cos(phi_c2), -np.sin(phi_c2), 0], [np.sin(phi_c2), np.cos(phi_c2), 0], [0, 0, 1]])
+
+    dR_pss_z_dphip = np.array([[-np.sin(phi_p), -np.cos(phi_p), 0], [np.cos(phi_p), -np.sin(phi_p), 0], [0, 0, 0]])
+    dR_cms1_z_dphic1 = np.array([[-np.sin(phi_c1), -np.cos(phi_c1), 0], [np.cos(phi_c1), -np.sin(phi_c1), 0], [0, 0, 0]])
+    dR_cms2_z_dphic2 = np.array([[-np.sin(phi_c2), -np.cos(phi_c2), 0], [np.cos(phi_c2), -np.sin(phi_c2), 0], [0, 0, 0]])
+
+    # 初始化三个质心雅可比矩阵
+    J_com_pss = np.zeros((3, 7))
+    J_com_cms1 = np.zeros((3, 7))
+    J_com_cms2 = np.zeros((3, 7))
+
+    # --- PSS质心雅可比 J_com_pss ---
+    # PSS质心只受PSS参数影响
+    J_com_pss[:, 0] = R_pss_z @ dcom_pss_dLp
+    J_com_pss[:, 1] = R_pss_z @ dcom_pss_dkp
+    J_com_pss[:, 2] = dR_pss_z_dphip @ com_pss_local
+
+    # --- CMS1质心雅可比 J_com_cms1 ---
+    # CMS1质心受PSS和CMS1参数影响
+    com_cms1_rotated = R_cms1_z @ com_cms1_local
+    # 对 PSS 参数求导
+    J_com_cms1[:, 0] = dT_pss_dLp[:3, :3] @ com_cms1_rotated + dT_pss_dLp[:3, 3]
+    J_com_cms1[:, 1] = dT_pss_dkp[:3, :3] @ com_cms1_rotated + dT_pss_dkp[:3, 3]
+    J_com_cms1[:, 2] = dT_pss_dphip[:3, :3] @ com_cms1_rotated + dT_pss_dphip[:3, 3]
+    # 对 CMS1 参数求导
+    J_com_cms1[:, 3] = T_pss[:3, :3] @ R_cms1_z @ dcom_cms1_dkc1
+    J_com_cms1[:, 4] = T_pss[:3, :3] @ dR_cms1_z_dphic1 @ com_cms1_local
+
+    # --- CMS2质心雅可比 J_com_cms2 ---
+    # CMS2质心受PSS, CMS1, CMS2参数影响
+    com_cms2_rotated = R_cms2_z @ com_cms2_local
+    # 对 PSS 参数求导
+    d_T_base_d_Lp = dT_pss_dLp @ T_cms1
+    d_T_base_d_kp = dT_pss_dkp @ T_cms1
+    d_T_base_d_phip = dT_pss_dphip @ T_cms1
+    J_com_cms2[:, 0] = d_T_base_d_Lp[:3, :3] @ com_cms2_rotated + d_T_base_d_Lp[:3, 3]
+    J_com_cms2[:, 1] = d_T_base_d_kp[:3, :3] @ com_cms2_rotated + d_T_base_d_kp[:3, 3]
+    J_com_cms2[:, 2] = d_T_base_d_phip[:3, :3] @ com_cms2_rotated + d_T_base_d_phip[:3, 3]
+    # 对 CMS1 参数求导
+    d_T_base_d_kc1 = T_pss @ dT_cms1_dkc1
+    d_T_base_d_phic1 = T_pss @ dT_cms1_dphic1
+    J_com_cms2[:, 3] = d_T_base_d_kc1[:3, :3] @ com_cms2_rotated + d_T_base_d_kc1[:3, 3]
+    J_com_cms2[:, 4] = d_T_base_d_phic1[:3, :3] @ com_cms2_rotated + d_T_base_d_phic1[:3, 3]
+    # 对 CMS2 参数求导
+    J_com_cms2[:, 5] = T_base_cms2[:3, :3] @ R_cms2_z @ dcom_cms2_dkc2
+    J_com_cms2[:, 6] = T_base_cms2[:3, :3] @ dR_cms2_z_dphic2 @ com_cms2_local
+
+    return {'pss': J_com_pss, 'cms1': J_com_cms1, 'cms2': J_com_cms2}
+
+def pcc_com_derivatives(q_segment, var_index):
+    """
+    [V-Final.6] 终极混合修复：恢复了对kappa=0的条件判断，并为else分支增加了Epsilon保险丝.
+    """
+    L, kappa, phi = q_segment[0], q_segment[1], q_segment[2]
+
+    if np.isclose(L, 0):
+        return np.array([0, 0, 0])
+
+    if np.isclose(kappa, 0):
+        if var_index == 0: # d/dL
+            return np.array([0, 0, 0.5])
+        else: # d/d_kappa, d/d_phi
+            return np.array([0, 0, 0])
+
+    kL = kappa * L
+    sin_kL = np.sin(kL)
+    cos_kL = np.cos(kL)
+
+    if var_index == 0: # d/dL
+        d_com_x_local_dL = (-L * kappa * cos_kL + sin_kL) / (L**2 * kappa**2 + EPSILON)
+        d_com_z_local_dL = (L * kappa * sin_kL + cos_kL - 1) / (L**2 * kappa**2 + EPSILON)
+        return np.array([d_com_x_local_dL, 0, d_com_z_local_dL])
+    elif var_index == 1: # d/d_kappa
+        d_com_x_local_dk = (-L * kappa * cos_kL - L * kappa + 2 * sin_kL) / (L * kappa**3 + EPSILON)
+        d_com_z_local_dk = (L * kappa * sin_kL + 2 * cos_kL - 2) / (L * kappa**3 + EPSILON)
+        return np.array([d_com_x_local_dk, 0, d_com_z_local_dk])
+    else: # d/d_phi
+        return np.array([0,0,0]) # Local COM is defined on the plane phi=0, so it does not change with phi
+
+def calculate_kinematic_jacobian_numerical(q, params, epsilon=1e-6):
+    """
+    【运动学雅可比-数值法】
+    [V2 - 修正] 采用对小角度旋转更鲁棒的计算方法。
+    """
+    J_kin = np.zeros((6, 7))
+    T_base, _ = forward_kinematics(q, params)
+    p_base = T_base[:3, 3]
+    R_base = T_base[:3, :3]
+
+    for i in range(7):
+        q_plus = q.copy()
+        q_plus[i] += epsilon
+        T_plus, _ = forward_kinematics(q_plus, params)
+        p_plus = T_plus[:3, 3]
+        R_plus = T_plus[:3, :3]
+
+        # 位置偏导数
+        J_kin[:3, i] = (p_plus - p_base) / epsilon
+
+        # 姿态偏导数 (旋转向量)
+        R_rel = R_plus @ R_base.T
+        trace = np.trace(R_rel)
+        
+        # 使用np.clip确保 arccos 的输入在有效范围内
+        angle = np.arccos(np.clip((trace - 1) / 2, -1.0, 1.0))
+        
+        if np.isclose(angle, 0):
+            # 当角度极小时，使用泰勒展开的近似，避免除以零
+            # rot_vec approx (R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]) / 2
+            rotation_vector = np.array([
+                R_rel[2, 1] - R_rel[1, 2],
+                R_rel[0, 2] - R_rel[2, 0],
+                R_rel[1, 0] - R_rel[0, 1]
+            ]) / 2.0
+        else:
+            # 标准的轴角转换公式
+            axis = np.array([
+                R_rel[2, 1] - R_rel[1, 2],
+                R_rel[0, 2] - R_rel[2, 0],
+                R_rel[1, 0] - R_rel[0, 1]
+            ]) / (2 * np.sin(angle))
+            rotation_vector = axis * angle
+        
+        J_kin[3:, i] = rotation_vector / epsilon
+        
+    return J_kin
+
+def __main__():
+    print("--- 运动学模块功能自检 ---")
+    from src.utils.read_config import load_config
+    config_params = load_config('config/config.json')
+    print("成功加载 'config.json' 中的参数.\n")
+
+    np.set_printoptions(precision=6, suppress=True)
+
+    q_test = np.array([0.1, 0.5, np.pi/4, 0.8, np.pi/2, 0.3, -np.pi/6])
+    print(f"--- 测试构型 q ---\n{q_test}")
+
+    T_final, _ = forward_kinematics(q_test, config_params)
+    print(f"\n--- 正运动学计算结果 (末端位姿 T) ---")
+    print(T_final)
+
+    print("\n--- 运动学雅可比对比测试 ---")
+    J_ana = calculate_kinematic_jacobian_analytical(q_test, config_params)
+    J_num = calculate_kinematic_jacobian_numerical(q_test, config_params)
+    diff_norm = np.linalg.norm(J_ana - J_num)
+
+    print(f"解析法雅可比 J_analytical:\n{J_ana}")
+    print(f"数值法雅可比 J_numerical:\n{J_num}")
+    print(f"差值范数: {diff_norm:.8f}")
+
+    if diff_norm < 1e-5:
+        print("【测试通过】: 解析法与数值法计算的运动学雅可比高度一致。\n")
+    else:
+        print("【测试失败】: 雅可比计算存在显著差异。\n")
+
+    print("--- 自检完成 ---")
+
+if __name__ == '__main__':
+    __main__()

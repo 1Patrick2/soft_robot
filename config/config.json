@@ -1,0 +1,69 @@
+{
+    "Geometry": {
+        "PSS_initial_length": 0.2,
+        "CMS_proximal_length": 0.050,
+        "CMS_distal_length": 0.050,
+        "short_lines": {
+            "diameter_m": 0.005,
+            "angles_deg": [0, 90, 180, 270]
+        },
+        "long_lines": {
+            "diameter_m": 0.007,
+            "angles_deg": [45, 135, 225, 315]
+        }
+    },
+    "Mass": {
+        "g": 9.80665,
+        "pss_kg": 0.03,
+        "cms_proximal_kg": 0.01,
+        "cms_distal_kg": 0.01
+    },
+    "Stiffness": {
+        "pss_total_equivalent_bending_stiffness": 5.0,
+        "cms_bending_stiffness": 0.05
+    },
+    "Initial_State": {
+        "q0": [
+            0.2,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ]
+    },
+    "Drive_Properties": {
+        "cable_stiffness": 5000.0,
+        "pretension_force_N": 0.5
+    },
+    "Solver": {
+      "pos_tol_m": 0.01,
+      "ori_tol_rad": 0.087266, 
+      "hessian_damp_alpha": 1e-3,
+      "hessian_rcond": 1e-6,
+      "pos_scale": 0.05,
+      "ori_scale": 0.1,
+      "scale_diff4": [0.01, 0.01, 0.01, 0.01],
+      "trf": {"ftol": 1e-6, "xtol": 1e-6, "gtol": 1e-6, "max_nfev": 1000, "use_numerical_jac": false},
+      "pso": {
+        "stageA": {"n_particles": 64, "iters": 50},
+        "stageB": {"n_particles": 64, "iters": 30}
+      },
+      "weights": {"w_pos": 1000.0, "w_ori": 0.5, "w_drive": 1e-4, "w_reg": 1e-4, "w_dl_penalty": 100.0, "w_pos_in_residual": 1.0, "w_ori_in_residual": 1.0, "pos_error_scale": 1000.0, "ori_error_scale": 57.29578}
+    },
+    "Bounds": {
+        "delta_l_bounds": [-0.12, 0.12],
+        "diff4_bounds": [-0.12, 0.12],
+        "q_bounds": {
+            "kappa_min": -10.0,
+            "kappa_max": 10.0,
+            "phi_min": -3.1415926535,
+            "phi_max": 3.1415926535
+        }
+    },
+    "ModelOptions": {
+      "cable_anchor_mode": "blend",
+      "cable_anchor_blend": 0.95
+    }
+}

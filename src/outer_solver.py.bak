@@ -1,0 +1,262 @@
+import sys
+import os
+
+# [路径修正] 将项目根目录添加到Python路径中
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+"""
+本模块是求解逆运动学问题的主入口。
+
+V5.0 版本更新:
+- [方向三] 优化目标重构为(位姿误差+弹性力梯度)，实现物理一致性和数值稳定性。
+"""
+import numpy as np
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation
+import logging
+import time
+
+# 本地项目模块导入
+from src.kinematics import forward_kinematics, calculate_kinematic_jacobian_analytical
+from src.statics import (
+    calculate_hessian_analytical, 
+    calculate_hessian, # <--- 新增导入
+    calculate_actuation_jacobian_analytical,
+    calculate_elastic_gradient_analytical,
+    calculate_elastic_hessian_analytical # 新增导入
+)
+from src.solver import solve_static_equilibrium
+from src.utils.read_config import load_config
+from src.nondimensionalizer import (
+    get_characteristic_scales, 
+    tau_from_nondimensional, tau_to_nondimensional
+)
+
+# 配置日志记录
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def calculate_pose_error(T_actual, T_target):
+    pos_error = T_actual[:3, 3] - T_target[:3, 3]
+    R_error = T_actual[:3, :3] @ T_target[:3, :3].T
+    orientation_error = Rotation.from_matrix(R_error).as_rotvec()
+    return np.concatenate([pos_error, orientation_error])
+
+def calculate_task_jacobian(tensions_si, q_guess_si, params_si):
+    try:
+        q_eq_si = solve_static_equilibrium(q_guess_si, tensions_si, params_si)
+        H_si = calculate_hessian_analytical(q_eq_si, tensions_si, params_si)
+        J_act_si = calculate_actuation_jacobian_analytical(q_eq_si, params_si)
+        C_si = -J_act_si.T
+        J_kin_si = calculate_kinematic_jacobian_analytical(q_eq_si, params_si)
+        # [根本性修复] 为海森矩阵求逆增加阻尼项(Damped Least Squares)，以处理奇点问题
+        damping_factor = 1e-6
+        H_damped_si = H_si + damping_factor * np.eye(H_si.shape[0])
+        H_inv_si = np.linalg.inv(H_damped_si)
+        dq_dtau_si = -H_inv_si @ C_si
+        J_task_si = J_kin_si @ dq_dtau_si
+        return J_task_si
+    except np.linalg.LinAlgError:
+        logging.warning("Hessian矩阵是奇异的,无法计算任务雅可比.返回一个零矩阵.")
+        return np.zeros((6, 8))
+
+def residual_function_nondimensional(
+    hat_tau_flat, T_target_si, q_guess_si, params_si, scales, 
+    hat_previous_tau_flat, smoothing_weight, pose_error_weight
+):
+    """
+    [V4.1 - 成功复现版] 残差函数
+    只包含位姿误差和平滑项，移除了所有不稳定的梯度能量项。
+    """
+    hat_tensions = {'tensions_short': hat_tau_flat[:4], 'tensions_long': hat_tau_flat[4:]}
+    tensions_si = tau_from_nondimensional(hat_tensions, scales)
+    q_eq_si = solve_static_equilibrium(q_guess_si, tensions_si, params_si)
+    T_actual_si, _ = forward_kinematics(q_eq_si, params_si)
+    
+    # --- 1. 位姿误差项 (6D) ---
+    error_vector_si = calculate_pose_error(T_actual_si, T_target_si)
+    hat_error_vector = np.copy(error_vector_si)
+    hat_error_vector[:3] /= scales['L_char']
+    # 使用高权重，强制求解器关注位姿精度
+    pose_error_term = hat_error_vector * np.sqrt(pose_error_weight) 
+
+    # --- 2. 平滑项 (8D) ---
+    if smoothing_weight > 0 and hat_previous_tau_flat is not None:
+        smoothing_term = np.sqrt(smoothing_weight) * (hat_tau_flat - hat_previous_tau_flat)
+    else:
+        smoothing_term = np.zeros_like(hat_tau_flat)
+
+    return np.concatenate([pose_error_term, smoothing_term])
+
+
+def analytical_jacobian_nondimensional(
+    hat_tau_flat, T_target_si, q_guess_si, params_si, scales, 
+    hat_previous_tau_flat, smoothing_weight, pose_error_weight
+):
+    """
+    [V5.0 新增] 计算残差函数的解析雅可比矩阵
+    """
+    hat_tensions = {'tensions_short': hat_tau_flat[:4], 'tensions_long': hat_tau_flat[4:]}
+    tensions_si = tau_from_nondimensional(hat_tensions, scales)
+
+    # 1. 计算任务雅可比 (物理单位)
+    # 注意: 需要在这里求解一次静力学平衡，以获得正确的q_eq来计算雅可比
+    q_eq_si = solve_static_equilibrium(q_guess_si, tensions_si, params_si)
+    J_task_si = calculate_task_jacobian(tensions_si, q_eq_si, params_si) # 使用q_eq_si而不是q_guess_si
+
+    # 2. 对雅可比矩阵进行无量纲化
+    scale_matrix = np.diag(
+        [1/scales['L_char']]*3 + [1]*3 # 对应位姿误差的6行
+    )
+    J_task_hat = scale_matrix @ J_task_si * scales['F_char']
+
+    # 3. 构造包含平滑项的完整雅可比矩阵
+    num_residuals = 14 # 6 for pose error, 8 for smoothing
+    num_vars = 8
+    J = np.zeros((num_residuals, num_vars))
+    
+    # 填充位姿误差部分的雅可比
+    J[:6, :] = J_task_hat * np.sqrt(pose_error_weight)
+
+    # 填充平滑项部分的雅可比
+    if smoothing_weight > 0 and hat_previous_tau_flat is not None:
+        J[6:, :] = np.eye(num_vars) * np.sqrt(smoothing_weight)
+
+    return J
+
+
+def solve_inverse_kinematics(
+    T_target, initial_tau_guess, q_guess, params, 
+    previous_tau=None, smoothing_weight=5e-6, pose_error_weight=100.0,
+    attempt_index=0  # 新增参数，用于追踪尝试次数
+):
+    """
+    [V5.0 - 加速版] 求解器
+    使用解析雅可比，大幅提升收敛速度和稳定性。
+    """
+    scales = get_characteristic_scales(params)
+    hat_tau_guess = tau_to_nondimensional(initial_tau_guess, scales)
+    hat_tau_guess_flat = np.concatenate([hat_tau_guess['tensions_short'], hat_tau_guess['tensions_long']])
+    
+    hat_previous_tau_flat = None
+    if previous_tau is not None:
+        hat_previous_tau = tau_to_nondimensional(previous_tau, scales)
+        hat_previous_tau_flat = np.concatenate([hat_previous_tau['tensions_short'], hat_previous_tau['tensions_long']])
+
+    bounds_si = ([0]*8, [100]*8)
+    hat_bounds = (np.array(bounds_si[0]), np.array(bounds_si[1]) / scales['F_char'])
+
+    # [最终诊断测试] 使用 '2-point' 数值雅可比，以验证解析雅可比的正确性
+    jac_func = analytical_jacobian_nondimensional
+    
+    result = least_squares(
+        fun=residual_function_nondimensional,
+        x0=hat_tau_guess_flat,
+        jac=jac_func, # <--- 使用解析雅可比
+        args=(T_target, q_guess, params, scales, hat_previous_tau_flat, smoothing_weight, pose_error_weight),
+        bounds=hat_bounds,
+        method='trf',
+        verbose=0,
+        ftol=1e-6, xtol=1e-6, gtol=1e-6
+    )
+
+    # 为结果对象附加额外信息
+    result.best_attempt_index = attempt_index
+    result.q_solution = None  # 默认值
+
+    if result.success:
+        hat_optimal_tau_flat = result.x
+        hat_optimal_tau = {'tensions_short': hat_optimal_tau_flat[:4], 'tensions_long': hat_optimal_tau_flat[4:]}
+        optimal_tau = tau_from_nondimensional(hat_optimal_tau, scales)
+        
+        # [核心修改] 在求解成功后，计算最终的q_solution并附加到结果中
+        try:
+            # 使用与本次求解相同的q_guess来计算最终的q_solution
+            q_solution = solve_static_equilibrium(q_guess, optimal_tau, params)
+            result.q_solution = q_solution
+        except Exception as e:
+            logging.warning(f"在最终求解q_solution时发生错误: {e}")
+
+        # 用物理单位的驱动力覆盖无量纲的result.x
+        result.x = np.concatenate([optimal_tau['tensions_short'], optimal_tau['tensions_long']])
+
+    return result
+
+def __main__():
+    """自检程序 - [V-Diag] 端到端单点IK验证"""
+    print("--- 外循环求解器模块功能自检 (V-Diag - 端到端单点IK验证) ---")
+    config_params = load_config('config/config.json')
+    q0 = np.array(config_params['Initial_State']['q0'])
+    robot_initial_length = config_params['Geometry']['PSS_initial_length']/1000 + \
+                           config_params['Geometry']['CMS_proximal_length']/1000 + \
+                           config_params['Geometry']['CMS_distal_length']/1000
+    np.set_printoptions(precision=6, suppress=True)
+
+    # 1. 设定一个简单的、物理可达的侧向位移目标
+    target_x_offset = 0.03 # 目标：侧向移动3厘米
+    T_target = np.array([
+        [1, 0, 0, target_x_offset],
+        [0, 1, 0, 0.0],
+        [0, 0, 1, robot_initial_length - 0.01], # 略微降低高度
+        [0, 0, 0, 1]
+    ])
+    
+    # 使用一个合理的、非对称的初始猜测
+    initial_tau_guess = {
+        'tensions_short': np.array([5.0, 0.0, 0.0, 0.0]), 
+        'tensions_long': np.array([5.0, 0.0, 0.0, 0.0])
+    }
+    
+    print(f"\n目标位姿 T_target:\n{T_target}")
+    print(f"目标末端位置: {T_target[:3, 3]}")
+
+    # 2. 调用IK求解器
+    result = solve_inverse_kinematics(
+        T_target, 
+        initial_tau_guess, 
+        q_guess=q0, 
+        params=config_params
+    )
+
+    print(f"\n--- IK 求解结果 ---")
+    print(f"成功: {result.success}")
+    print(f"信息: {result.message}")
+    
+    if not result.success or result.q_solution is None:
+        print("\n❌ [诊断失败] IK求解器未能成功收敛，无法进行下一步验证。")
+        return
+
+    q_solution = result.q_solution
+    print(f"求解得到的构型 q_solution:\n{q_solution}")
+
+    # 3. 手动进行正向运动学验证
+    print("\n--- 正向运动学 (FK) 验证 ---")
+    T_check, _ = forward_kinematics(q_solution, config_params)
+    
+    print(f"将 q_solution代入FK后得到的实际位姿 T_check:\n{T_check}")
+    
+    # 4. 对比分析
+    print("\n--- 最终诊断 ---")
+    target_pos = T_target[:3, 3]
+    actual_pos = T_check[:3, 3]
+    
+    # To avoid division by zero if target is [0,0,z]
+    # We check the most important component, x
+    if np.abs(target_pos[0]) > 1e-9:
+        ratio_x = actual_pos[0] / target_pos[0]
+        print(f"X轴 实际/目标 位置比例: {ratio_x:.4f}")
+        if np.isclose(ratio_x, 2.0, atol=0.2):
+            print("\n‼️ [诊断确认] 存在2倍误差！")
+            print("   IK求解器找到的构型，其正向运动学结果是目标的约2倍。")
+            print("   这强烈表明问题出在IK求解链(J_outer = -J_kin * H^-1 * C)的某个环节，")
+            print("   它让模型误认为自己比实际情况要'硬'，从而输出了过大的驱动力/构型变化。")
+        elif np.allclose(target_pos, actual_pos, atol=1e-3):
+            print("\n✅ [诊断异常] 未发现2倍误差。")
+            print("   IK求解与FK验证结果一致。半径2倍化问题可能仅在特定路径或动态下出现。")
+        else:
+            print("\n⚠️ [诊断 inconclusive] 存在误差，但不是明显的2倍关系。")
+    else:
+        print("目标X位置为0，无法计算比例。")
+
+
+if __name__ == '__main__':
+    __main__()
