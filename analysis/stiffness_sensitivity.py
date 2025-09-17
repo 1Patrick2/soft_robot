@@ -1,123 +1,132 @@
 import numpy as np
+import matplotlib.pyplot as plt
 import sys
 import os
 import time
 import multiprocessing
-import itertools
+from tqdm import tqdm
 from copy import deepcopy
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# 将项目根目录添加到Python路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.utils.read_config import load_config
-from analysis.workspace_analysis import run_monte_carlo_workspace_analysis, calculate_workspace_volume
+from src.solver import solve_static_equilibrium_diff4
+from src.kinematics import forward_kinematics
 
+def pretension_continuation(diff4_target, cfg):
+    q_guess = np.zeros(6)
+    target_pretension = cfg['Drive_Properties']['pretension_force_N']
+    pretension_path = sorted(list(set([0.0, 0.1, 0.2, 0.3] + [target_pretension])))
+    pretension_path = [p for p in pretension_path if p <= target_pretension]
+    if not pretension_path or pretension_path[-1] != target_pretension:
+        pretension_path.append(target_pretension)
 
-def run_stiffness_test_worker(args):
-    """并行计算的工作单元，负责测试单一刚度组合。"""
-    config_path, pss_stiffness, cms_stiffness, base_q0_6d = args
-    
-    # 1. 加载基础配置
-    params = load_config(config_path)
-    
-    # 2. 应用当前的刚度组合进行修改
-    params['Stiffness']['pss_total_equivalent_bending_stiffness'] = pss_stiffness
-    params['Stiffness']['cms_bending_stiffness'] = cms_stiffness
-    
-    # 3. 运行蒙特卡洛工作空间分析 (使用较少的样本以加速)
-    workspace_points = run_monte_carlo_workspace_analysis(
-        params,
-        num_samples=1000,  # [V-Final 优化] 减少样本量以在合理时间内完成分析
-        max_displacement=0.05,
-        q0_6d=base_q0_6d,
-        use_tqdm=False, # 在子进程中关闭tqdm，避免打印混乱
-        parallel=False  # <--- [核心修复] 彻底关闭内层并行！
-    )
-    
-    # 4. 计算并返回工作空间体积
-    volume = calculate_workspace_volume(workspace_points)
-    
-    return pss_stiffness, cms_stiffness, volume
+    for p in pretension_path:
+        cfg_local = deepcopy(cfg)
+        cfg_local['Drive_Properties']['pretension_force_N'] = p
+        res_dict = solve_static_equilibrium_diff4(q_guess, diff4_target, cfg_local)
+        q_new = res_dict['q_solution']
+        if q_new is None:
+            return None
+        q_guess = q_new
+    return q_guess
 
-if __name__ == '__main__':
-    start_time = time.time()
-    print("--- [V-Final] 启动刚度参数敏感性分析... --- ")
-
-    # --- 1. 定义刚度的对数搜索空间 ---
-    # --- 1. [核心] 定义第三轮的“冲顶”搜索空间 ---
-    # X轴 (PSS): 在0.01到0.05之间进行精细线性搜索
-    pss_stiffness_range = np.linspace(0.01, 0.05, 5)
-
-    # Y轴 (CMS): 在0.5到15.0之间进行拓展性对数搜索
-    cms_stiffness_range = np.logspace(np.log10(0.5), np.log10(15.0), 5)
-    
-    num_combinations = len(pss_stiffness_range) * len(cms_stiffness_range)
-
-    print("\n定义的参数搜索空间:")
-    print(f"  - pss_stiffness: {len(pss_stiffness_range)} points from {pss_stiffness_range[0]:.3f} to {pss_stiffness_range[-1]:.3f}")
-    print(f"  - cms_stiffness: {len(cms_stiffness_range)} points from {cms_stiffness_range[0]:.3f} to {cms_stiffness_range[-1]:.3f}")
-    print(f"\n总计需要测试 {num_combinations} 种刚度组合。")
-
-    # --- 2. 准备基础配置和并行任务 ---
+def worker_solve_for_stiffness(args):
+    diff4_target, pss_stiffness = args
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, 'config', 'config.json')
-    base_config = load_config(config_path)
-    q0_7d = np.array(base_config['Initial_State']['q0'])
-    q0_6d = q0_7d[1:]
+    params = load_config(config_path)
+    params['Stiffness']['pss_total_equivalent_bending_stiffness'] = pss_stiffness
+    q_eq = pretension_continuation(diff4_target, params)
+    if q_eq is not None:
+        try:
+            T_final, _ = forward_kinematics(q_eq, params)
+            return T_final[:3, 3]
+        except Exception:
+            return None
+    return None
 
-    tasks = [(config_path, pss, cms, q0_6d) for pss in pss_stiffness_range for cms in cms_stiffness_range]
+def run_sensitivity_analysis():
+    print("--- Starting PSS Stiffness Sensitivity Analysis ---")
+    stiffness_values = np.linspace(15.0, 25.0, 10)
+    num_samples_per_stiffness = 200
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(project_root, 'config', 'config.json')
+    params = load_config(config_path)
+    diff4_bounds = params.get('Bounds', {}).get('diff4_bounds', [-0.12, 0.12])
+    results = []
 
-    # --- 3. 并行执行设计寻优 ---
-    num_cpus = multiprocessing.cpu_count()
-    print(f"\n使用 {max(1, num_cpus - 1)} 个CPU核心并行执行寻优...")
+    for stiffness in tqdm(stiffness_values, desc="Scanning PSS Stiffnesses"):
+        tasks = []
+        for _ in range(num_samples_per_stiffness):
+            random_diff4 = np.random.uniform(diff4_bounds[0], diff4_bounds[1], size=4)
+            tasks.append((random_diff4, stiffness))
+        
+        reachable_points = []
+        with multiprocessing.Pool(processes=max(1, multiprocessing.cpu_count() - 1)) as pool:
+            point_results = list(tqdm(pool.imap(worker_solve_for_stiffness, tasks), total=len(tasks), desc=f"PSS Stiffness {stiffness:.2f}", leave=False))
+            for p in point_results:
+                if p is not None:
+                    reachable_points.append(p)
+
+        if not reachable_points:
+            print(f"Warning: No reachable points found for stiffness = {stiffness:.4f}")
+            results.append({'stiffness': stiffness, 'mean_z_rel': 0, 'max_z_rel': 0, 'mean_radius': 0, 'success_rate': 0})
+            continue
+            
+        points_arr = np.array(reachable_points)
+        base_z = params['Geometry']['PSS_initial_length']
+        z_coords_rel = points_arr[:, 2] - base_z
+        xy_radius = np.linalg.norm(points_arr[:, :2], axis=1)
+        
+        mean_z_rel = np.mean(z_coords_rel)
+        max_z_rel = np.max(z_coords_rel)
+        mean_radius = np.mean(xy_radius)
+        success_rate = len(reachable_points) / num_samples_per_stiffness
+        
+        results.append({
+            'stiffness': stiffness,
+            'mean_z_rel': mean_z_rel,
+            'max_z_rel': max_z_rel,
+            'mean_radius': mean_radius,
+            'success_rate': success_rate
+        })
+        
+        print(f"Stiffness: {stiffness:.2f} -> Mean Z_rel: {mean_z_rel:.4f}, Max Z_rel: {max_z_rel:.4f}, Mean Radius: {mean_radius:.4f}, Success: {success_rate*100:.0f}%")
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+    fig.suptitle('PSS Bending Stiffness Sensitivity Analysis', fontsize=16)
+    stiffness_axis = [r['stiffness'] for r in results]
     
-    from tqdm import tqdm
-    with multiprocessing.Pool(processes=max(1, num_cpus - 1)) as pool:
-        results = list(tqdm(pool.imap(run_stiffness_test_worker, tasks), total=num_combinations, desc="Stiffness Sensitivity"))
-
-    # --- 4. 分析并报告结果 ---
-    print("\n--- 敏感性分析完成 ---")
+    axes[0].plot(stiffness_axis, [r['mean_z_rel'] for r in results], 'bo-', label='Mean Z (relative to base)')
+    axes[0].plot(stiffness_axis, [r['max_z_rel'] for r in results], 'ro-', label='Max Z (relative to base)')
+    axes[0].set_ylabel('Z Coordinate (m)')
+    axes[0].set_title('Workspace Height')
+    axes[0].legend()
+    axes[0].grid(True)
     
-    best_volume = -1
-    best_pss = None
-    best_cms = None
-
-    # 将结果重塑为网格以便绘图
-    volumes = np.zeros((len(pss_stiffness_range), len(cms_stiffness_range)))
-    for pss, cms, vol in results:
-        if vol > best_volume:
-            best_volume = vol
-            best_pss = pss
-            best_cms = cms
-        # 找到pss和cms在原始范围中的索引
-        pss_idx = np.where(np.isclose(pss_stiffness_range, pss))[0][0]
-        cms_idx = np.where(np.isclose(cms_stiffness_range, cms))[0][0]
-        volumes[pss_idx, cms_idx] = vol
-
-    end_time = time.time()
-    print(f"总耗时: {end_time - start_time:.2f} 秒")
-
-    if best_pss is not None:
-        print("\n🏆 发现最优刚度组合! 🏆")
-        print(f"  - 最大工作空间体积: {best_volume * 1e6:.2f} cm^3")
-        print(f"  - 最佳PSS刚度: {best_pss:.4f}")
-        print(f"  - 最佳CMS刚度: {best_cms:.4f}")
-        print(f"  - 最佳刚度比 (PSS/CMS): {best_pss/best_cms:.2f}")
-    else:
-        print("\n❌ 未能找到任何有效的配置。")
-
-    # --- 5. 绘制热力图 ---
-    print("\n正在绘制热力图...")
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(volumes.T, xticklabels=np.round(pss_stiffness_range, 3), yticklabels=np.round(cms_stiffness_range, 4), annot=True, fmt=".2e", cmap="viridis")
-    plt.xlabel("PSS Bending Stiffness (pss_total_equivalent_bending_stiffness)")
-    plt.ylabel("CMS Bending Stiffness (cms_bending_stiffness)")
-    plt.title("Stiffness Sensitivity vs. Workspace Volume (Convex Hull)")
-    plt.gca().invert_yaxis() # Y轴通常是升序的
+    axes[1].plot(stiffness_axis, [r['mean_radius'] for r in results], 'go-', label='Mean Radius')
+    axes[1].set_ylabel('XY Radius (m)')
+    axes[1].set_title('Workspace Radius')
+    axes[1].legend()
+    axes[1].grid(True)
     
-    heatmap_path = os.path.join(project_root, 'plots', 'sensitivity_analysis_stiffness_heatmap_round3.png')
-    plt.savefig(heatmap_path, dpi=300)
-    print(f"热力图已保存至: {os.path.abspath(heatmap_path)}")
-    plt.close()
+    axes[2].plot(stiffness_axis, [r['success_rate'] for r in results], 'ko-', label='Success Rate')
+    axes[2].set_ylabel('Success Rate')
+    axes[2].set_title('Solver Success Rate')
+    axes[2].set_xlabel('PSS Bending Stiffness (Nm^2/rad)')
+    axes[2].legend()
+    axes[2].grid(True)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plot_filename = os.path.join(project_root, 'plots', 'sensitivity_analysis_pss_stiffness.png')
+    plt.savefig(plot_filename)
+    print(f"\nSensitivity analysis plot saved to {plot_filename}")
+    plt.close(fig)
+
+if __name__ == '__main__':
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
+    run_sensitivity_analysis()

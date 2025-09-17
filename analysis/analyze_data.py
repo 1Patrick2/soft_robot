@@ -3,62 +3,77 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
-def analyze_workspace_data(data_path, plot_path):
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def analyze_q_distribution(data_filepath):
     """
-    Analyzes the workspace data to quantitatively assess its "fullness".
+    Analyzes the distribution of the configuration vector q, especially kc1 and kc2,
+    from a saved workspace data file.
     """
-    if not os.path.exists(data_path):
-        print(f"Error: Data file not found at {data_path}")
+    if not os.path.exists(data_filepath):
+        print(f"Error: Data file not found at {data_filepath}")
         return
 
-    points = np.load(data_path)
-    if points.shape[0] < 10:
-        print("Error: Not enough data points to analyze.")
+    try:
+        data = np.load(data_filepath, allow_pickle=True)
+    except Exception as e:
+        print(f"Error loading data file: {e}")
         return
 
-    # 1. Calculate the centroid
-    centroid = np.mean(points, axis=0)
+    if data.size == 0:
+        print("Error: Data file is empty.")
+        return
 
-    # 2. Calculate the radial distance of each point from the centroid
-    radial_distances = np.linalg.norm(points - centroid, axis=1)
+    # Extract q_eq vectors
+    q_eqs = np.array([item['q_eq'] for item in data])
 
-    # 3. Calculate key metrics
-    mean_radius = np.mean(radial_distances)
-    std_dev_radius = np.std(radial_distances) # This is our "Fullness Score"
-    min_radius = np.min(radial_distances)
-    max_radius = np.max(radial_distances)
+    kp = q_eqs[:, 0]
+    phip = q_eqs[:, 1]
+    kc1 = q_eqs[:, 2]
+    phic1 = q_eqs[:, 3]
+    kc2 = q_eqs[:, 4]
+    phic2 = q_eqs[:, 5]
 
-    # 4. Print the quantitative analysis
-    print("\n--- Quantitative Workspace Analysis ---")
-    print(f"Number of points: {len(points)}")
-    print(f"Centroid: {centroid}")
-    print(f"Mean Radial Distance: {mean_radius:.4f} m")
-    print(f"Min / Max Radial Distance: {min_radius:.4f} m / {max_radius:.4f} m")
-    print(f"Std Dev of Radial Distance (Fullness Score): {std_dev_radius:.4f}")
-    print("---------------------------------------")
-    print("Interpretation:")
-    print("- A LARGER 'Fullness Score' (Std Dev) suggests a more voluminous, less 'shell-like' workspace.")
-    print("- A histogram with a wide spread indicates a 'solid' workspace, while a sharp peak indicates a 'hollow' one.")
+    print(f"--- Bending Analysis for: {os.path.basename(data_filepath)} ---")
+    print(f"Total points analyzed: {len(q_eqs)}")
+    print("\n--- Statistics for kc1 (Proximal CMS) ---")
+    print(f"  Mean:   {np.mean(kc1):.4f}")
+    print(f"  Std Dev:{np.std(kc1):.4f}")
+    print(f"  Min:    {np.min(kc1):.4f}")
+    print(f"  Max:    {np.max(kc1):.4f}")
+    print(f"  Median: {np.median(kc1):.4f}")
 
-
-    # 5. Generate and save a histogram of the radial distances
-    plt.figure(figsize=(10, 6))
-    plt.hist(radial_distances, bins=50, alpha=0.75, label='Point Distribution')
-    plt.title('Distribution of Workspace Points by Radial Distance from Centroid')
-    plt.xlabel('Distance from Centroid (m)')
-    plt.ylabel('Number of Points')
-    plt.grid(True)
-    plt.axvline(mean_radius, color='r', linestyle='--', linewidth=2, label=f'Mean: {mean_radius:.4f}m')
-    plt.legend()
+    print("\n--- Statistics for kc2 (Distal CMS) ---")
+    print(f"  Mean:   {np.mean(kc2):.4f}")
+    print(f"  Std Dev:{np.std(kc2):.4f}")
+    print(f"  Min:    {np.min(kc2):.4f}")
+    print(f"  Max:    {np.max(kc2):.4f}")
+    print(f"  Median: {np.median(kc2):.4f}")
     
-    os.makedirs(os.path.dirname(plot_path), exist_ok=True)
-    plt.savefig(plot_path)
-    print(f"\nAnalysis histogram saved to {os.path.abspath(plot_path)}")
-    plt.close()
+    # Plotting histograms
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    fig.suptitle(f'Distribution of CMS Curvatures ({os.path.basename(data_filepath)})')
 
+    axes[0].hist(kc1, bins=30, color='skyblue', edgecolor='black')
+    axes[0].set_title('kc1 (Proximal CMS)')
+    axes[0].set_xlabel('Curvature (rad/m)')
+    axes[0].set_ylabel('Frequency')
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+
+    axes[1].hist(kc2, bins=30, color='salmon', edgecolor='black')
+    axes[1].set_title('kc2 (Distal CMS)')
+    axes[1].set_xlabel('Curvature (rad/m)')
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+    
+    plot_filename = os.path.join(os.path.dirname(data_filepath), f'bending_analysis_{os.path.basename(data_filepath).replace(".npy","")}.png')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(plot_filename)
+    print(f"\nHistogram plot saved to {plot_filename}")
+    plt.close(fig)
 
 if __name__ == '__main__':
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_file = os.path.join(project_root, 'plots', 'workspace_points.npy')
-    plot_file = os.path.join(project_root, 'plots', 'workspace_fullness_histogram.png')
-    analyze_workspace_data(data_file, plot_file)
+    # The new data file from the pretension continuation run
+    data_file = os.path.join(project_root, 'plots', 'workspace_points_pretension_continuation_500.npy')
+    
+    analyze_q_distribution(data_file)

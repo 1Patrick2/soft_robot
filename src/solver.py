@@ -24,7 +24,7 @@ from src.nondimensionalizer import (
 # === 内循环求解器 (位移控) - [V-Final.Robust]
 # =====================================================================
 
-def solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params):
+def solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params, force_robust_solver=False):
     """
     [V-Final.Robust] 核心求解器，包含多初值重启与回退机制。
     """
@@ -64,61 +64,72 @@ def solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params):
             hat_bounds.append((low, high))
 
     # --- 优化策略 ---
-    # 1. 主力求解器: L-BFGS-B
-    result = minimize(
-        objective_function_hat, 
-        hat_q_guess, 
-        method='L-BFGS-B',
-        jac=jacobian_function_hat, 
-        bounds=hat_bounds,
-        options=lbfgsb_opts
-    )
-
-    # 2. [Optimized] 多初值重启机制
-    if not result.success:
-        logging.warning(f"[Solver] L-BFGS-B failed on initial guess. Attempting {n_restarts} restarts.")
-        for i in range(n_restarts):
-            hat_q_perturbed = hat_q_guess + np.random.randn(len(hat_q_guess)) * 0.1 # 10% perturbation
-            result_retry = minimize(
-                objective_function_hat, 
-                hat_q_perturbed, 
-                method='L-BFGS-B',
-                jac=jacobian_function_hat, 
-                bounds=hat_bounds,
-                options=lbfgsb_opts
-            )
-            if result_retry.success:
-                logging.info(f"[Solver] L-BFGS-B succeeded on restart #{i+1}.")
-                result = result_retry
-                break
-        else: # This else belongs to the for loop, executed if loop finishes without break
-            logging.warning("[Solver] All L-BFGS-B restarts failed.")
-
-    # 3. 备用求解器: Powell
-    if not result.success:
-        logging.warning(f"[Solver] Fallback to Powell optimizer.\nL-BFGS-B final result:\n{result}")
-        # [关键加固] 使用L-BFGS-B失败时的'x'作为Powell的初值
-        hat_q_start_powell = result.x if result.x is not None else hat_q_guess
-
+    if force_robust_solver:
+        # 如果强制使用稳健求解器，直接进入Powell
+        logging.info("[Solver] Robust mode forced. Using Powell directly.")
         result = minimize(
             objective_function_hat,
-            hat_q_start_powell,
+            hat_q_guess,
             method='Powell',
             options=powell_opts
         )
-
-    # 4. [新增] 终极备用求解器: SLSQP (带温启动)
-    if not result.success:
-        logging.warning(f"[Solver] Fallback to ULTIMATE optimizer: SLSQP...")
-        hat_q_start_slsqp = result.x if result.x is not None else hat_q_guess
+    else:
+        # 否则，执行我们正常的三级回退流程
+        # 1. 主力求解器: L-BFGS-B
         result = minimize(
-            objective_function_hat,
-            hat_q_start_slsqp,
-            method='SLSQP',
-            jac=jacobian_function_hat, # SLSQP 也可以使用梯度信息
+            objective_function_hat, 
+            hat_q_guess, 
+            method='L-BFGS-B',
+            jac=jacobian_function_hat, 
             bounds=hat_bounds,
-            options={'ftol': 1e-7, 'maxiter': 2000}
+            options=lbfgsb_opts
         )
+
+        # 2. [Optimized] 多初值重启机制
+        if not result.success:
+            logging.warning(f"[Solver] L-BFGS-B failed on initial guess. Attempting {n_restarts} restarts.")
+            for i in range(n_restarts):
+                hat_q_perturbed = hat_q_guess + np.random.randn(len(hat_q_guess)) * 0.1 # 10% perturbation
+                result_retry = minimize(
+                    objective_function_hat, 
+                    hat_q_perturbed, 
+                    method='L-BFGS-B',
+                    jac=jacobian_function_hat, 
+                    bounds=hat_bounds,
+                    options=lbfgsb_opts
+                )
+                if result_retry.success:
+                    logging.info(f"[Solver] L-BFGS-B succeeded on restart #{i+1}.")
+                    result = result_retry
+                    break
+            else: # This else belongs to the for loop, executed if loop finishes without break
+                logging.warning("[Solver] All L-BFGS-B restarts failed.")
+
+        # 3. 备用求解器: Powell
+        if not result.success:
+            logging.warning(f"[Solver] Fallback to Powell optimizer.\nL-BFGS-B final result:\n{result}")
+            # [关键加固] 使用L-BFGS-B失败时的'x'作为Powell的初值
+            hat_q_start_powell = result.x if result.x is not None else hat_q_guess
+
+            result = minimize(
+                objective_function_hat,
+                hat_q_start_powell,
+                method='Powell',
+                options=powell_opts
+            )
+
+        # 4. [新增] 终极备用求解器: SLSQP (带温启动)
+        if not result.success:
+            logging.warning(f"[Solver] Fallback to ULTIMATE optimizer: SLSQP...")
+            hat_q_start_slsqp = result.x if result.x is not None else hat_q_guess
+            result = minimize(
+                objective_function_hat,
+                hat_q_start_slsqp,
+                method='SLSQP',
+                jac=jacobian_function_hat, # SLSQP 也可以使用梯度信息
+                bounds=hat_bounds,
+                options={'ftol': 1e-7, 'maxiter': 2000}
+            )
 
     # [Optimized] 扩展返回信息
     if result.success and not np.any(np.isnan(result.x)):
@@ -129,13 +140,14 @@ def solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params):
         return {"q_solution": None, "result": result}
 
 
-def solve_static_equilibrium_diff4(q_guess, diff4, params):
+
+def solve_static_equilibrium_diff4(q_guess, diff4, params, force_robust_solver=False):
     """
     [NEW] Wrapper for the main solver that accepts a 4D differential drive input.
     """
     from src.statics import expand_diff4_to_motor8
     delta_l_motor = expand_diff4_to_motor8(diff4, params)
-    return solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params)
+    return solve_static_equilibrium_disp_ctrl(q_guess, delta_l_motor, params, force_robust_solver=force_robust_solver)
 
 
 # =====================================================================

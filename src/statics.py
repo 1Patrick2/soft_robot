@@ -10,7 +10,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.kinematics import (
     forward_kinematics,
     calculate_com_jacobians_analytical,
-    
 )
 from src.utils.read_config import load_config
 
@@ -29,7 +28,6 @@ def calculate_drive_mapping(q_6d, params):
     alphas_short = np.deg2rad(geo['short_lines']['angles_deg'])
     alphas_long  = np.deg2rad(geo['long_lines']['angles_deg'])
 
-    # --- [NEW] Selectable Anchor Mode & Model Consistency --- 
     model_opts = params.get('ModelOptions', {})
     mode = model_opts.get('cable_anchor_mode', 'base')
     blend = model_opts.get('cable_anchor_blend', 0.0)
@@ -38,89 +36,25 @@ def calculate_drive_mapping(q_6d, params):
 
     if mode == 'pss_end':
         z_anchor = Lp
-        q_for_fk[0:2] = 0.0 # Enforce PSS decoupling for FK calculation
+        q_for_fk[0:2] = 0.0
     elif mode == 'base':
         z_anchor = 0.0
     else: # 'blend' mode
         z_anchor = (1.0 - blend) * 0.0 + blend * Lp
-        # Note: Blending q is complex, for now we only blend jacobian and anchor Z
 
-    # --- Define Start and End Anchor Points ---
-    # Start points (at base or PSS end)
     p_start_s = np.vstack([r_short * np.cos(alphas_short), r_short * np.sin(alphas_short), np.full_like(alphas_short, z_anchor)])
     p_start_l = np.vstack([r_long * np.cos(alphas_long),   r_long * np.sin(alphas_long),   np.full_like(alphas_long, z_anchor)])
 
-    # [BUGFIX] End points are defined locally (z=0) in their respective frames
     p_end_s_local = np.vstack([r_short * np.cos(alphas_short), r_short * np.sin(alphas_short), np.zeros_like(alphas_short)])
     p_end_l_local = np.vstack([r_long * np.cos(alphas_long),   r_long * np.sin(alphas_long),   np.zeros_like(alphas_long)])
 
-    # --- FK to get segment end transforms ---
     T_final, _, _, T_base_cms2 = forward_kinematics(q_for_fk, params, return_all_transforms=True)
     T_cms1_end = T_base_cms2
     T_cms2_end = T_final
 
-    # --- Transform end points to world frame ---
     p_end_s_world = (T_cms1_end @ np.vstack([p_end_s_local, np.ones_like(alphas_short)]))[:3, :]
     p_end_l_world = (T_cms2_end @ np.vstack([p_end_l_local, np.ones_like(alphas_long)]))[:3, :]
 
-    # --- Calculate cable lengths ---
-    # The straight length (l0) depends on where the cable starts
-    l0_s = (Lp - z_anchor) + Lc1
-    l0_l = (Lp - z_anchor) + Lc1 + Lc2
-
-    len_s_bent = np.linalg.norm(p_end_s_world - p_start_s, axis=0)
-    len_l_bent = np.linalg.norm(p_end_l_world - p_start_l, axis=0)
-
-    delta_s = l0_s - len_s_bent
-    delta_l = l0_l - len_l_bent
-
-    return np.concatenate([delta_s, delta_l])
-    # --- Get parameters ---
-    geo = params['Geometry']
-    Lp = geo['PSS_initial_length']
-    Lc1 = geo['CMS_proximal_length']
-    Lc2 = geo['CMS_distal_length']
-    r_short = geo['short_lines']['diameter_m'] / 2
-    r_long  = geo['long_lines']['diameter_m'] / 2
-    alphas_short = np.deg2rad(geo['short_lines']['angles_deg'])
-    alphas_long  = np.deg2rad(geo['long_lines']['angles_deg'])
-
-    # --- [NEW] Selectable Anchor Mode & Model Consistency --- 
-    model_opts = params.get('ModelOptions', {})
-    mode = model_opts.get('cable_anchor_mode', 'base')
-    blend = model_opts.get('cable_anchor_blend', 0.0)
-
-    q_for_fk = q_6d.copy()
-
-    if mode == 'pss_end':
-        z_anchor = Lp
-        q_for_fk[0:2] = 0.0 # Enforce PSS decoupling for FK calculation
-    elif mode == 'base':
-        z_anchor = 0.0
-    else: # 'blend' mode
-        z_anchor = (1.0 - blend) * 0.0 + blend * Lp
-        # Note: Blending q is complex, for now we only blend jacobian and anchor Z
-
-    # --- Define Start and End Anchor Points ---
-    # Start points (at base or PSS end)
-    p_start_s = np.vstack([r_short * np.cos(alphas_short), r_short * np.sin(alphas_short), np.full_like(alphas_short, z_anchor)])
-    p_start_l = np.vstack([r_long * np.cos(alphas_long),   r_long * np.sin(alphas_long),   np.full_like(alphas_long, z_anchor)])
-
-    # [BUGFIX] End points are defined locally (z=0) in their respective frames
-    p_end_s_local = np.vstack([r_short * np.cos(alphas_short), r_short * np.sin(alphas_short), np.zeros_like(alphas_short)])
-    p_end_l_local = np.vstack([r_long * np.cos(alphas_long),   r_long * np.sin(alphas_long),   np.zeros_like(alphas_long)])
-
-    # --- FK to get segment end transforms ---
-    T_final, _, _, T_base_cms2 = forward_kinematics(q_for_fk, params, return_all_transforms=True)
-    T_cms1_end = T_base_cms2
-    T_cms2_end = T_final
-
-    # --- Transform end points to world frame ---
-    p_end_s_world = (T_cms1_end @ np.vstack([p_end_s_local, np.ones_like(alphas_short)]))[:3, :]
-    p_end_l_world = (T_cms2_end @ np.vstack([p_end_l_local, np.ones_like(alphas_long)]))[:3, :]
-
-    # --- Calculate cable lengths ---
-    # The straight length (l0) depends on where the cable starts
     l0_s = (Lp - z_anchor) + Lc1
     l0_l = (Lp - z_anchor) + Lc1 + Lc2
 
@@ -139,10 +73,16 @@ def calculate_elastic_potential_energy(q_6d, params):
     Lc2 = params['Geometry']['CMS_distal_length']
     K_bending_pss = params['Stiffness']['pss_total_equivalent_bending_stiffness']
     K_bending_cms = params['Stiffness']['cms_bending_stiffness']
+    
     U_pss_bending = 0.5 * K_bending_pss * Lp * kp**2
     U_cms1_bending = 0.5 * K_bending_cms * Lc1 * kc1**2
     U_cms2_bending = 0.5 * K_bending_cms * Lc2 * kc2**2
-    return U_pss_bending + U_cms1_bending + U_cms2_bending
+
+    # --- new balance term ---
+    k_balance = params['Stiffness'].get('cms_balance_coeff', 0.0)
+    U_balance = 0.5 * k_balance * (kc1 - kc2)**2
+
+    return U_pss_bending + U_cms1_bending + U_cms2_bending + U_balance
 
 def calculate_gravity_potential_energy(q_6d, params):
     g = params['Mass']['g']
@@ -156,11 +96,11 @@ def calculate_gravity_potential_energy(q_6d, params):
 def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
-def smooth_max_zero(x, beta=50.0):
+def smooth_max_zero(x, beta=40.0):
     """ [FIXED] A smooth approximation of max(0, x) that is zero at x=0. """
     return x * _sigmoid(beta * x)
 
-def smooth_max_zero_derivative(x, beta=50.0):
+def smooth_max_zero_derivative(x, beta=40.0):
     """ [FIXED] The derivative of the new smooth_max_zero function. """
     s = _sigmoid(beta * x)
     return s + beta * x * s * (1 - s)
@@ -185,10 +125,14 @@ def calculate_elastic_gradient_analytical(q_6d, params):
     Lc2 = params['Geometry']['CMS_distal_length']
     K_bending_pss = params['Stiffness']['pss_total_equivalent_bending_stiffness']
     K_bending_cms = params['Stiffness']['cms_bending_stiffness']
+    
+    # --- new balance term gradient ---
+    k_balance = params['Stiffness'].get('cms_balance_coeff', 0.0)
+
     grad = np.zeros(6)
     grad[0] = K_bending_pss * Lp * kp
-    grad[2] = K_bending_cms * Lc1 * kc1
-    grad[4] = K_bending_cms * Lc2 * kc2
+    grad[2] = K_bending_cms * Lc1 * kc1 + k_balance * (kc1 - kc2)
+    grad[4] = K_bending_cms * Lc2 * kc2 - k_balance * (kc1 - kc2)
     return grad
 
 def calculate_gravity_gradient_analytical(q_6d, params):
@@ -200,18 +144,6 @@ def calculate_gravity_gradient_analytical(q_6d, params):
     grad = g * (mass_p * J_com_dict['pss'][2, :] + mass_c1 * J_com_dict['cms1'][2, :] + mass_c2 * J_com_dict['cms2'][2, :])
     return grad
 
-# def calculate_actuation_jacobian_numerical(q, params, epsilon=1e-6):
-#     """ [DEPRECATED] Now replaced by analytical version. """
-#     J_act = np.zeros((8, 6))
-#     for i in range(6):
-#         h = epsilon * max(1.0, abs(q[i]))
-#         q_plus = q.copy(); q_plus[i] += h
-#         q_minus = q.copy(); q_minus[i] -= h
-#         plus = calculate_drive_mapping(q_plus, params)
-#         minus = calculate_drive_mapping(q_minus, params)
-#         J_act[:, i] = (plus - minus) / (2.0 * h)
-#     return J_act
-
 def _skew(v):
     """Converts a 3-element vector to a 3x3 skew-symmetric matrix."""
     return np.array([[0, -v[2], v[1]],
@@ -220,132 +152,55 @@ def _skew(v):
 
 def calculate_actuation_jacobian_analytical(q_6d, params):
     """
-    [V6.0 REFACTORED & MODULAR ANCHOR] Calculates the analytical actuation jacobian d(delta_l_robot)/dq.
-    This version directly uses the verified jacobians from the kinematics module and supports multiple anchor modes.
+    [V-Final & Corrected] Calculates the analytical actuation jacobian d(delta_l_robot)/dq.
+    This version uses the "Pure Mechanics Decoupling" philosophy for consistency.
     """
-    # --- 核心依赖 ---
     from src.kinematics import calculate_kinematic_jacobian_analytical
-
-    # --- Get geometry and config ---
     geo = params['Geometry']
+    model_opts = params.get('ModelOptions', {})
+    mode = model_opts.get('cable_anchor_mode', 'base')
+    blend = model_opts.get('cable_anchor_blend', 0.0)
+    
     Lp = geo['PSS_initial_length']
     r_s = geo['short_lines']['diameter_m'] / 2
     r_l = geo['long_lines']['diameter_m'] / 2
     alphas_s = np.deg2rad(geo['short_lines']['angles_deg'])
     alphas_l = np.deg2rad(geo['long_lines']['angles_deg'])
 
-    # --- [NEW] Selectable Anchor Mode & Model Consistency --- 
-    model_opts = params.get('ModelOptions', {})
-    mode = model_opts.get('cable_anchor_mode', 'base')
-    blend = model_opts.get('cable_anchor_blend', 0.0)
-
     q_for_fk = q_6d.copy()
-
+    
     if mode == 'pss_end':
         z_anchor = Lp
-        q_for_fk[0:2] = 0.0 # Enforce PSS decoupling for FK calculation
+        q_for_fk[0:2] = 0.0
     elif mode == 'base':
         z_anchor = 0.0
     else: # 'blend' mode
         z_anchor = (1.0 - blend) * 0.0 + blend * Lp
 
-    # --- Get full kinematic Jacobians from the kinematics module ---
     J_total, J_cms1, _ = calculate_kinematic_jacobian_analytical(q_for_fk, params)
-
-    # --- Get intermediate transforms from kinematics ---
     T_final, _, _, T_base_cms2 = forward_kinematics(q_for_fk, params, return_all_transforms=True)
     T_cms1_end = T_base_cms2
     T_cms2_end = T_final
 
-    # --- Define Anchor Points (with bugfix and new feature) ---
-    # Start points (at base or PSS end)
     p_start_s = np.vstack([r_s*np.cos(alphas_s), r_s*np.sin(alphas_s), np.full_like(alphas_s, z_anchor)])
     p_start_l = np.vstack([r_l*np.cos(alphas_l), r_l*np.sin(alphas_l), np.full_like(alphas_l, z_anchor)])
-
-    # [BUGFIX] End points are defined locally (z=0) in their respective frames
     p_end_s_local = np.vstack([r_s*np.cos(alphas_s), r_s*np.sin(alphas_s), np.zeros_like(alphas_s)])
     p_end_l_local = np.vstack([r_l*np.cos(alphas_l), r_l*np.sin(alphas_l), np.zeros_like(alphas_l)])
-
-    # --- Transform end points to world frame ---
     p_end_s_world = (T_cms1_end @ np.vstack([p_end_s_local, np.ones(4)]))[:3,:]
     p_end_l_world = (T_cms2_end @ np.vstack([p_end_l_local, np.ones(4)]))[:3,:]
-
-    # --- Calculate world-frame point jacobians (J_p = J_v - skew(r) @ J_w) ---
+    
     J_p_s_all = np.zeros((4, 3, 6))
-    J_p_l_all = np.zeros((4, 3, 6))
-
     r_s_world_cols = (T_cms1_end[:3, :3] @ p_end_s_local).T
-    J_v_s = J_cms1[:3, :]; J_w_s = J_cms1[3:, :]
+    J_v_s, J_w_s = J_cms1[:3, :], J_cms1[3:, :]
     for i in range(4):
         J_p_s_all[i, :, :] = J_v_s - _skew(r_s_world_cols[i, :]) @ J_w_s
 
-    r_l_world_cols = (T_cms2_end[:3, :3] @ p_end_l_local).T
-    J_v_l = J_total[:3,:]; J_w_l = J_total[3:,:]
-    for i in range(4):
-        J_p_l_all[i, :, :] = J_v_l - _skew(r_l_world_cols[i, :]) @ J_w_l
-
-    # --- 核心依赖 ---
-    from src.kinematics import calculate_kinematic_jacobian_analytical
-
-    # --- Get geometry and config ---
-    geo = params['Geometry']
-    Lp = geo['PSS_initial_length']
-    r_s = geo['short_lines']['diameter_m'] / 2
-    r_l = geo['long_lines']['diameter_m'] / 2
-    alphas_s = np.deg2rad(geo['short_lines']['angles_deg'])
-    alphas_l = np.deg2rad(geo['long_lines']['angles_deg'])
-
-    # --- [NEW] Selectable Anchor Mode & Model Consistency --- 
-    model_opts = params.get('ModelOptions', {})
-    mode = model_opts.get('cable_anchor_mode', 'base')
-    blend = model_opts.get('cable_anchor_blend', 0.0)
-
-    q_for_fk = q_6d.copy()
-
-    if mode == 'pss_end':
-        z_anchor = Lp
-        q_for_fk[0:2] = 0.0 # Enforce PSS decoupling for FK calculation
-    elif mode == 'base':
-        z_anchor = 0.0
-    else: # 'blend' mode
-        z_anchor = (1.0 - blend) * 0.0 + blend * Lp
-
-    # --- Get full kinematic Jacobians from the kinematics module ---
-    J_total, J_cms1, _ = calculate_kinematic_jacobian_analytical(q_for_fk, params)
-
-    # --- Get intermediate transforms from kinematics ---
-    T_final, _, _, T_base_cms2 = forward_kinematics(q_for_fk, params, return_all_transforms=True)
-    T_cms1_end = T_base_cms2
-    T_cms2_end = T_final
-
-    # --- Define Anchor Points (with bugfix and new feature) ---
-    # Start points (at base or PSS end)
-    p_start_s = np.vstack([r_s*np.cos(alphas_s), r_s*np.sin(alphas_s), np.full_like(alphas_s, z_anchor)])
-    p_start_l = np.vstack([r_l*np.cos(alphas_l), r_l*np.sin(alphas_l), np.full_like(alphas_l, z_anchor)])
-
-    # [BUGFIX] End points are defined locally (z=0) in their respective frames
-    p_end_s_local = np.vstack([r_s*np.cos(alphas_s), r_s*np.sin(alphas_s), np.zeros_like(alphas_s)])
-    p_end_l_local = np.vstack([r_l*np.cos(alphas_l), r_l*np.sin(alphas_l), np.zeros_like(alphas_l)])
-
-    # --- Transform end points to world frame ---
-    p_end_s_world = (T_cms1_end @ np.vstack([p_end_s_local, np.ones(4)]))[:3,:]
-    p_end_l_world = (T_cms2_end @ np.vstack([p_end_l_local, np.ones(4)]))[:3,:]
-
-    # --- Calculate world-frame point jacobians (J_p = J_v - skew(r) @ J_w) ---
-    J_p_s_all = np.zeros((4, 3, 6))
     J_p_l_all = np.zeros((4, 3, 6))
-
-    r_s_world_cols = (T_cms1_end[:3, :3] @ p_end_s_local).T
-    J_v_s = J_cms1[:3, :]; J_w_s = J_cms1[3:, :]
-    for i in range(4):
-        J_p_s_all[i, :, :] = J_v_s - _skew(r_s_world_cols[i, :]) @ J_w_s
-
     r_l_world_cols = (T_cms2_end[:3, :3] @ p_end_l_local).T
-    J_v_l = J_total[:3,:]; J_w_l = J_total[3:,:]
+    J_v_l, J_w_l = J_total[:3,:], J_total[3:,:]
     for i in range(4):
         J_p_l_all[i, :, :] = J_v_l - _skew(r_l_world_cols[i, :]) @ J_w_l
 
-    # --- Calculate final actuation jacobian d(delta_l)/dq ---
     d_s = p_end_s_world - p_start_s
     d_l = p_end_l_world - p_start_l
     len_s = np.linalg.norm(d_s, axis=0)
@@ -358,19 +213,8 @@ def calculate_actuation_jacobian_analytical(q_6d, params):
     for i in range(4):
         if len_l[i] > 1e-9:
             J_act[i+4, :] = - (d_l[:, i].T / len_l[i]) @ J_p_l_all[i, :, :]
-
-    # --- [NEW] Blend/Zero PSS columns based on anchor mode ---
-    # The logic of zeroing out q_for_fk[0:2] for pss_end mode should
-    # naturally result in the correct (zero) jacobian columns.
-    # Manually zeroing them here was redundant and caused inconsistencies.
-    # The same applies to the blend mode scaling.
-    # if mode == 'pss_end':
-    #     J_act[:, 0:2] = 0.0
-    # elif mode == 'blend':
-    #     J_act[:, 0:2] *= (1.0 - blend)
-
+        
     return J_act
-
 
 def calculate_actuation_gradient_analytical(q_6d, delta_l_motor, params):
     k_cable = params['Drive_Properties']['cable_stiffness']
@@ -379,7 +223,6 @@ def calculate_actuation_gradient_analytical(q_6d, delta_l_motor, params):
     stretch_tensioned = smooth_max_zero(stretch)
     deriv_smooth_max = smooth_max_zero_derivative(stretch)
     dU_cable_d_delta_l = -k_cable * stretch_tensioned * deriv_smooth_max
-    # --- USE ANALYTICAL JACOBIAN ---
     J_act = calculate_actuation_jacobian_analytical(q_6d, params)
     grad_cable = J_act.T @ dU_cable_d_delta_l
     f_pre = params['Drive_Properties'].get('pretension_force_N', 0.0)
@@ -403,36 +246,17 @@ def calculate_gradient_disp_ctrl(q_6d, delta_l_motor, params):
     return total_grad
 
 def expand_diff4_to_motor8(diff4, params):
-    """
-    [V3 CORRECTED FOR DIAGONAL DRIVE] Expands a 4D differential drive vector 
-    into an 8D motor displacement vector. This version correctly handles the
-    45-degree offset of the long lines using vector projection.
-    """
     delta_l_motor = np.zeros(8)
-    
-    # --- Short lines (proximal bending) ---
-    # Orthogonal layout (0, 90, 180, 270 deg) - This part is correct.
-    delta_l_motor[0] =  diff4[0]  # +X direction
-    delta_l_motor[1] =  diff4[1]  # +Y direction
-    delta_l_motor[2] = -diff4[0]  # -X direction
-    delta_l_motor[3] = -diff4[1]  # -Y direction
-    
-    # --- Long lines (distal bending) ---
-    # Correctly decompose desired (dx, dy) motion onto diagonal cables.
-    dx = diff4[2]  # Desired X-component motion
-    dy = diff4[3]  # Desired Y-component motion
-    
-    # Get the physical angles from the config file to be robust
+    delta_l_motor[0] =  diff4[0]
+    delta_l_motor[1] =  diff4[1]
+    delta_l_motor[2] = -diff4[0]
+    delta_l_motor[3] = -diff4[1]
+    dx = diff4[2]
+    dy = diff4[3]
     long_line_angles = np.deg2rad(params['Geometry']['long_lines']['angles_deg'])
-
-    # Project the (dx, dy) vector onto each cable's direction vector
     for i in range(4):
         angle = long_line_angles[i]
-        # The amount to pull/release is the projection of (dx, dy) onto the cable's direction vector.
-        # Note: Cable's direction vector is (cos(angle), sin(angle)).
-        # Pull is positive, so we use this projection directly.
         delta_l_motor[i + 4] = dx * np.cos(angle) + dy * np.sin(angle)
-    
     return delta_l_motor
 
 if __name__ == '__main__':
@@ -458,25 +282,21 @@ if __name__ == '__main__':
         print(f"  - \u89e3\u6790\u6cd5: {analytical_grad}")
         print(f"  - \u6570\u503c\u6cd5 (\u4e2d\u5fc3\u5dee\u5206): {numerical_grad}")
         print(f"  - \u76f8\u5bf9\u8bef\u5dee: {rel_error:.6e}")
-        if rel_error < 5e-5: # Looser tolerance for actuation gradient
+        if rel_error < 5e-5:
             print("  - ✅ \u901a\u8fc7")
-            
             return True
         else:
             print(f"  - ❌ \u5931\u8d25 (\u5dee\u503c: {analytical_grad - numerical_grad})")
             return False
 
-    # 1. \u5f39\u6027\u80fd\u91cf
     grad_e_ana = calculate_elastic_gradient_analytical(q_test, params)
     grad_e_num = approx_fprime(q_test, lambda q: calculate_elastic_potential_energy(q, params), eps)
     test1 = compare_gradients("\u5f39\u6027\u80fd\u91cf (Elastic)", grad_e_ana, grad_e_num)
 
-    # 2. \u91cd\u529b\u52bf\u80fd
     grad_g_ana = calculate_gravity_gradient_analytical(q_test, params)
     grad_g_num = approx_fprime(q_test, lambda q: calculate_gravity_potential_energy(q, params), eps)
     test2 = compare_gradients("\u91cd\u529b\u52bf\u80fd (Gravity)", grad_g_ana, grad_g_num)
 
-    # 3. \u9a71\u52a8\u76f8\u5173\u80fd\u91cf (U_cable + U_pretension)
     grad_a_ana = calculate_actuation_gradient_analytical(q_test, delta_l_motor_test, params)
     def actuation_energy_func(q):
         k_cable = params['Drive_Properties']['cable_stiffness']
@@ -489,8 +309,6 @@ if __name__ == '__main__':
     grad_a_num = approx_fprime(q_test, actuation_energy_func, eps)
     test3 = compare_gradients("\u9a71\u52a8\u80fd\u91cf (Actuation)", grad_a_ana, grad_a_num)
 
-    # 4. \u603b\u5782\u76f4
-    print("\n---\u603b\u5782\u76f4\u9a8c\u8bc1---")
     total_grad_ana = calculate_gradient_disp_ctrl(q_test, delta_l_motor_test, params)
     total_grad_num = approx_fprime(q_test, lambda q: calculate_total_potential_energy_disp_ctrl(q, delta_l_motor_test, params), eps)
     test4 = compare_gradients("\u603b\u548c (Total)", total_grad_ana, total_grad_num)
@@ -545,7 +363,7 @@ def calculate_hessian_disp_ctrl_high_performance(q_6d, delta_l_motor, params):
     
     # 2. Gauss-Newton approximation for Cable Hessian
     k_cable = params['Drive_Properties']['cable_stiffness']
-    J_act = calculate_actuation_jacobian_numerical(q_6d, params)
+    J_act = calculate_actuation_jacobian_analytical(q_6d, params) # Use analytical jacobian
     H_C_approx = k_cable * (J_act.T @ J_act)
     
     # 3. Analytical Regularization Hessian
@@ -564,7 +382,3 @@ def calculate_hessian_disp_ctrl_high_performance(q_6d, delta_l_motor, params):
     H_total_approx = H_E + H_C_approx + H_reg + H_G
     
     return H_total_approx
-
-
-
-

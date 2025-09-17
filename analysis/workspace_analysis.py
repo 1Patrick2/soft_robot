@@ -6,119 +6,81 @@ import os
 import time
 import multiprocessing
 from tqdm import tqdm
-import random
+from copy import deepcopy
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.utils.read_config import load_config
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import sys
-import os
-import time
-import multiprocessing
-from tqdm import tqdm
-import random
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.utils.read_config import load_config
-# 修正: 导入新的 diff4 求解器
 from src.solver import solve_static_equilibrium_diff4
 from src.kinematics import forward_kinematics
-# 修正: 导入 expand_diff4_to_motor8 用于后处理
-from src.statics import calculate_total_potential_energy_disp_ctrl, calculate_drive_mapping, expand_diff4_to_motor8
 
-def continuation_solve_diff4(q_guess, diff4, params, n_steps=30):
+def pretension_continuation(diff4_target, cfg):
     """
-    [IMPROVED as per test.md Step 4] Solves via parameter continuation (homotopy) on stiffness.
-    Uses a smoother stiffness ramp and retries on failure.
+    Solves for the equilibrium configuration using a pretension continuation method.
+    Starts with zero pretension and gradually ramps up to the target pretension,
+    using the previous solution as a warm start.
     """
-    orig_k_pss = params['Stiffness']['pss_total_equivalent_bending_stiffness']
-    orig_k_cms = params['Stiffness']['cms_bending_stiffness']
+    q_guess = np.zeros(6)
     
-    local_params = params.copy()
-    local_params['Stiffness'] = params['Stiffness'].copy()
+    # Define a path for the pretension force
+    target_pretension = cfg['Drive_Properties']['pretension_force_N']
+    pretension_path = sorted(list(set([0.0, 0.1, 0.2, 0.3, 0.5, 1.0] + [target_pretension])))
+    # Ensure the path does not exceed the target
+    pretension_path = [p for p in pretension_path if p <= target_pretension]
 
-    try:
-        q_current = q_guess
-        for i in range(n_steps + 1):
-            t = i / n_steps
-            # Smoother stiffness ramp as per test.md
-            stiffness_scale = 1e-6 + (t**2)
-            
-            local_params['Stiffness']['pss_total_equivalent_bending_stiffness'] = orig_k_pss * stiffness_scale
-            local_params['Stiffness']['cms_bending_stiffness'] = orig_k_cms * stiffness_scale
-            
-            result_dict = solve_static_equilibrium_diff4(q_current, diff4, local_params)
-            q_new = result_dict["q_solution"]
-            
-            # Retry logic as per test.md
-            if q_new is None:
-                for _ in range(5): # Retry 5 times
-                    q_try = q_current + np.random.randn(6) * 1e-3 # Small perturbation
-                    result_dict = solve_static_equilibrium_diff4(q_try, diff4, local_params)
-                    q_new = result_dict["q_solution"]
-                    if q_new is not None:
-                        break
-            
-            if q_new is None:
-                return None 
-            q_current = q_new
-        return q_current
-    finally:
-        params['Stiffness']['pss_total_equivalent_bending_stiffness'] = orig_k_pss
-        params['Stiffness']['cms_bending_stiffness'] = orig_k_cms
+    for p in pretension_path:
+        cfg_local = deepcopy(cfg)
+        cfg_local['Drive_Properties']['pretension_force_N'] = p
+        res_dict = solve_static_equilibrium_diff4(q_guess, diff4_target, cfg_local)
+        q_new = res_dict['q_solution']
+        if q_new is None:
+            return None  # Continuation failed
+        q_guess = q_new
+        
+    # One final solve at the target pretension to be sure
+    final_res_dict = solve_static_equilibrium_diff4(q_guess, diff4_target, cfg)
+    return final_res_dict['q_solution']
 
 def worker_solve_single_point(args):
+    """
+    Worker function for parallel processing. Solves for a single target control input.
+    """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, 'config', 'config.json')
     params = load_config(config_path)
 
-    i, q0_6d = args
-    np.random.seed(os.getpid() + int(time.time()))
+    i, diff4_target = args
     
-    # 步骤3: 直接采样 diff4
-    diff4_bounds = params.get('Bounds', {}).get('diff4_bounds', [-0.12, 0.12])
-    random_diff4 = np.random.uniform(diff4_bounds[0], diff4_bounds[1], size=4)
-    
-    q_guess_rand = np.zeros(6)
-    # Use a more conservative initial guess to improve stability
-    q_guess_rand[::2] = np.random.uniform(-2.0, 2.0, 3)
-    q_guess_rand[1::2] = np.random.uniform(-np.pi, np.pi, 3)
-    
-    # 调用新的 continuation 求解器
-    q_eq = continuation_solve_diff4(q_guess_rand, random_diff4, params)
+    # Use the new pretension continuation solver
+    q_eq = pretension_continuation(diff4_target, params)
     
     if q_eq is not None and not np.any(np.isnan(q_eq)) and not np.any(np.isinf(q_eq)):
         try:
-            # 为了计算能量和拉伸，需要将 diff4 展开
-            delta_l_motor = expand_diff4_to_motor8(random_diff4, params)
+            # Use original params for final FK calculation
             T_final, _ = forward_kinematics(q_eq, params)
-            U_total = calculate_total_potential_energy_disp_ctrl(q_eq, delta_l_motor, params)
-            delta_l_robot = calculate_drive_mapping(q_eq, params)
-            stretch = delta_l_motor - delta_l_robot
-            
             return ("success", {
                 "pos": T_final[:3, 3],
-                "diff4": random_diff4, # 保存 diff4
+                "diff4": diff4_target,
                 "q_eq": q_eq,
-                "U_total": U_total,
-                "stretch": stretch
             })
         except Exception:
             return ("kin_fail", None)
     return ("solver_fail", None)
 
-def run_monte_carlo_workspace_analysis(num_samples=4000, use_tqdm=True, parallel=True):
+def run_workspace_analysis(num_samples=500, use_tqdm=True, parallel=True):
+    """
+    Runs the workspace analysis using Monte Carlo sampling and the pretension continuation solver.
+    """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, 'config', 'config.json')
     params = load_config(config_path)
-    q0_7d = np.array(params['Initial_State']['q0'])
-    q0_6d = q0_7d[1:]
+    diff4_bounds = params.get('Bounds', {}).get('diff4_bounds', [-0.12, 0.12])
 
-    tasks = [(i, q0_6d) for i in range(num_samples)]
+    tasks = []
+    for i in range(num_samples):
+        random_diff4 = np.random.uniform(diff4_bounds[0], diff4_bounds[1], size=4)
+        tasks.append((i, random_diff4))
+            
     reachable_points_data = []
     fail_counts = {'solver_fail': 0, 'kin_fail': 0}
 
@@ -129,7 +91,7 @@ def run_monte_carlo_workspace_analysis(num_samples=4000, use_tqdm=True, parallel
         with multiprocessing.Pool(processes=max(1, num_cpus - 1)) as pool:
             results_iterator = pool.imap_unordered(worker_solve_single_point, tasks)
             if use_tqdm:
-                results_iterator = tqdm(results_iterator, total=num_samples, desc="Calculating Workspace (Homotopy)")
+                results_iterator = tqdm(results_iterator, total=num_samples, desc=f"Calculating Workspace ({num_samples} samples)")
             
             for status, result_dict in results_iterator:
                 if status == "success":
@@ -139,7 +101,7 @@ def run_monte_carlo_workspace_analysis(num_samples=4000, use_tqdm=True, parallel
     else:
         iterator = tasks
         if use_tqdm:
-            iterator = tqdm(iterator, desc="Calculating Workspace (Homotopy, Serial)")
+            iterator = tqdm(iterator, desc=f"Calculating Workspace ({num_samples} samples, Serial)")
         for task in iterator:
             status, result_dict = worker_solve_single_point(task)
             if status == "success":
@@ -156,7 +118,7 @@ def run_monte_carlo_workspace_analysis(num_samples=4000, use_tqdm=True, parallel
 
     return reachable_points_data
 
-def plot_workspace_3_view(points, output_filename='plots/workspace_plot_homotopy.png', slice_width=0.01):
+def plot_workspace_3_view(points, output_filename, slice_width=0.01):
     if points is None or len(points) < 1:
         print("Warning: Not enough points to plot workspace.")
         return
@@ -167,10 +129,11 @@ def plot_workspace_3_view(points, output_filename='plots/workspace_plot_homotopy
 
     print(f"\nPlotting workspace 3-view... Saving to '{output_filename}'")
     fig = plt.figure(figsize=(14, 21))
-    fig.suptitle('Workspace Analysis (Homotopy Method)', fontsize=16)
+    fig.suptitle('Workspace Analysis (Pretension Continuation)', fontsize=16)
 
     ws_x, ws_y, ws_z = points[:, 0], points[:, 1], points[:, 2]
 
+    # ... (Plotting code is identical to before) ...
     ax3d = fig.add_subplot(3, 2, 1, projection='3d')
     ax3d.scatter(ws_x, ws_y, ws_z, c='c', marker='.', s=2, alpha=0.3, label='Workspace')
     ax3d.set_title('3D View')
@@ -208,7 +171,7 @@ def plot_workspace_3_view(points, output_filename='plots/workspace_plot_homotopy
     if len(slice_x0_points) > 0:
         ax_slice_x0.scatter(slice_x0_points[:, 1], slice_x0_points[:, 2], c='m', marker='.', s=5, alpha=0.5)
     ax_slice_x0.set_title(f'Cross-Section at X=0 (slice width {slice_width*2:.2f}m)')
-    ax_slice_x0.set_xlabel('Y (m)'); ax_slice_x0.set_ylabel('Z (m)')
+    ax_slice_x0.set_xlabel('Y (m)'); ax_slice_y0.set_ylabel('Z (m)')
     ax_slice_x0.grid(True); ax_slice_x0.axis('equal')
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
@@ -216,32 +179,24 @@ def plot_workspace_3_view(points, output_filename='plots/workspace_plot_homotopy
     print(f"3-view plot saved to {os.path.abspath(output_filename)}")
     plt.close(fig)
 
-
 if __name__ == '__main__':
     start_time = time.time()
     
-    print(f"--- Starting Monte Carlo Workspace Analysis (Homotopy Method) ---")
+    num_samples = 500
+    print(f"--- Starting Workspace Analysis (Pretension Continuation, {num_samples} random samples) ---")
     
-    workspace_full_data = run_monte_carlo_workspace_analysis(num_samples=1500)
+    workspace_full_data = run_workspace_analysis(num_samples=num_samples)
     
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_filename = os.path.join(project_root, 'plots', 'workspace_points_homotopy.npy')
-    output_plot_filename = 'plots/workspace_plot_homotopy.png'
+    data_filename = os.path.join(project_root, 'plots', f'workspace_points_pretension_continuation_{num_samples}.npy')
+    output_plot_filename = f'plots/workspace_plot_pretension_continuation_{num_samples}.png'
     os.makedirs(os.path.dirname(data_filename), exist_ok=True)
     
-    save_data = np.array(workspace_full_data, dtype=object)
-    np.save(data_filename, save_data, allow_pickle=True)
-    print(f"Workspace data (homotopy) saved to {os.path.abspath(data_filename)}")
-    
     if workspace_full_data:
-        stretches = np.array([d['stretch'] for d in workspace_full_data])
-        num_tight_cables = np.sum(stretches > 1e-6, axis=1)
+        save_data = np.array([d for d in workspace_full_data], dtype=object)
+        np.save(data_filename, save_data, allow_pickle=True)
+        print(f"Workspace data saved to {os.path.abspath(data_filename)}")
         
-        print("\n--- Stretch Diagnostics (Homotopy Method) ---")
-        print(f"Avg. number of tight cables per successful point: {np.mean(num_tight_cables):.2f}")
-        print(f"Max stretch observed: {np.max(stretches)*1000:.2f} mm")
-        print(f"Avg. max stretch per point: {np.mean(np.max(stretches, axis=1))*1000:.2f} mm")
-
         workspace_points = np.array([d['pos'] for d in workspace_full_data])
         plot_workspace_3_view(workspace_points, output_filename=output_plot_filename)
     else:
