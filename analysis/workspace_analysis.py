@@ -6,119 +6,105 @@ import os
 import time
 import multiprocessing
 from tqdm import tqdm
-from copy import deepcopy
+from functools import partial
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.utils.read_config import load_config
-from src.solver import solve_static_equilibrium_diff4
-from src.kinematics import forward_kinematics
+from src.cosserat.solver import solve_static_equilibrium
+from src.cosserat.kinematics import forward_kinematics, discretize_robot
 
-def pretension_continuation(diff4_target, cfg):
+def trace_single_path(task_args):
     """
-    Solves for the equilibrium configuration using a pretension continuation method.
-    Starts with zero pretension and gradually ramps up to the target pretension,
-    using the previous solution as a warm start.
+    Worker function for parallel processing. Traces a single path from boundary to center.
     """
-    q_guess = np.zeros(6)
+    path_id, delta_l_boundary, params, solver_opts, num_path_steps = task_args
     
-    # Define a path for the pretension force
-    target_pretension = cfg['Drive_Properties']['pretension_force_N']
-    pretension_path = sorted(list(set([0.0, 0.1, 0.2, 0.3, 0.5, 1.0] + [target_pretension])))
-    # Ensure the path does not exceed the target
-    pretension_path = [p for p in pretension_path if p <= target_pretension]
+    _, (n_pss, n_cms1, n_cms2) = discretize_robot(params)
+    num_elements = n_pss + n_cms1 + n_cms2
 
-    for p in pretension_path:
-        cfg_local = deepcopy(cfg)
-        cfg_local['Drive_Properties']['pretension_force_N'] = p
-        res_dict = solve_static_equilibrium_diff4(q_guess, diff4_target, cfg_local)
-        q_new = res_dict['q_solution']
-        if q_new is None:
-            return None  # Continuation failed
-        q_guess = q_new
-        
-    # One final solve at the target pretension to be sure
-    final_res_dict = solve_static_equilibrium_diff4(q_guess, diff4_target, cfg)
-    return final_res_dict['q_solution']
+    path = np.linspace(delta_l_boundary, np.zeros(8), num_path_steps)
+    q_guess = np.zeros((3, num_elements))  # Reset guess for each new path
+    points_on_path = []
 
-def worker_solve_single_point(args):
-    """
-    Worker function for parallel processing. Solves for a single target control input.
-    """
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(project_root, 'config', 'config.json')
-    params = load_config(config_path)
+    for delta_l_step in path:
+        solve_result = solve_static_equilibrium(
+            q_guess, delta_l_step, params, solver_options=solver_opts
+        )
+        kappas_eq = solve_result["kappas_solution"]
 
-    i, diff4_target = args
-    
-    # Use the new pretension continuation solver
-    q_eq = pretension_continuation(diff4_target, params)
-    
-    if q_eq is not None and not np.any(np.isnan(q_eq)) and not np.any(np.isinf(q_eq)):
-        try:
-            # Use original params for final FK calculation
-            T_final, _ = forward_kinematics(q_eq, params)
-            return ("success", {
+        if kappas_eq is not None:
+            q_guess = kappas_eq  # Warm start for the next step
+            T_final, _ = forward_kinematics(kappas_eq, params)
+            points_on_path.append({
                 "pos": T_final[:3, 3],
-                "diff4": diff4_target,
-                "q_eq": q_eq,
+                "delta_l": delta_l_step,
+                "kappas_eq": kappas_eq,
             })
-        except Exception:
-            return ("kin_fail", None)
-    return ("solver_fail", None)
+        else:
+            # If a step fails, stop tracing this path
+            tqdm.write(f"Path {path_id} failed to converge, stopping trace for this path.")
+            break
+    return points_on_path
 
-def run_workspace_analysis(num_samples=500, use_tqdm=True, parallel=True):
+def run_workspace_analysis_homotopy(num_paths_per_set=4, num_steps_per_path=20):
     """
-    Runs the workspace analysis using Monte Carlo sampling and the pretension continuation solver.
+    Generates a solid workspace by tracing homotopy paths from various boundary configurations.
     """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, 'config', 'config.json')
     params = load_config(config_path)
-    diff4_bounds = params.get('Bounds', {}).get('diff4_bounds', [-0.12, 0.12])
+
+    if 'Cosserat' not in params:
+        params['Cosserat'] = {'num_elements_pss': 10, 'num_elements_cms1': 5, 'num_elements_cms2': 5}
+
+    delta_l_bounds = params.get('Bounds', {}).get('delta_l_bounds', [-0.05, 0.05])
+    max_actuation = delta_l_bounds[1]
+    m = max_actuation
+
+    # --- Define a richer set of boundary actuations ---
+    boundary_actuations = []
+    # 1. Pure bending (opposing pairs on short cables)
+    boundary_actuations.append([m, 0, -m, 0, 0, 0, 0, 0])
+    boundary_actuations.append([-m, 0, m, 0, 0, 0, 0, 0])
+    boundary_actuations.append([0, m, 0, -m, 0, 0, 0, 0])
+    boundary_actuations.append([0, -m, 0, m, 0, 0, 0, 0])
+    # 2. Pure bending (opposing pairs on long cables)
+    boundary_actuations.append([0, 0, 0, 0, m, 0, -m, 0])
+    boundary_actuations.append([0, 0, 0, 0, -m, 0, m, 0])
+    boundary_actuations.append([0, 0, 0, 0, 0, m, 0, -m])
+    boundary_actuations.append([0, 0, 0, 0, 0, -m, 0, m])
+    # 3. Diagonal pulls (short cables)
+    boundary_actuations.append([m, m, 0, 0, 0, 0, 0, 0])
+    boundary_actuations.append([m, -m, 0, 0, 0, 0, 0, 0])
+    boundary_actuations.append([-m, m, 0, 0, 0, 0, 0, 0])
+    boundary_actuations.append([-m, -m, 0, 0, 0, 0, 0, 0])
+    # 4. Single pulls (all 8 cables)
+    for i in range(8):
+        vec = np.zeros(8)
+        vec[i] = m
+        boundary_actuations.append(vec)
 
     tasks = []
-    for i in range(num_samples):
-        random_diff4 = np.random.uniform(diff4_bounds[0], diff4_bounds[1], size=4)
-        tasks.append((i, random_diff4))
-            
-    reachable_points_data = []
-    fail_counts = {'solver_fail': 0, 'kin_fail': 0}
+    solver_opts = {'ftol': 1e-4, 'gtol': 1e-4, 'maxiter': 500}
+    for i, delta_l_boundary in enumerate(boundary_actuations):
+        tasks.append((i, np.array(delta_l_boundary), params, solver_opts, num_steps_per_path))
 
-    if parallel:
-        num_cpus = multiprocessing.cpu_count()
-        if use_tqdm:
-            print(f"Detected {num_cpus} CPU cores. Using {max(1, num_cpus - 1)} processes.")
-        with multiprocessing.Pool(processes=max(1, num_cpus - 1)) as pool:
-            results_iterator = pool.imap_unordered(worker_solve_single_point, tasks)
-            if use_tqdm:
-                results_iterator = tqdm(results_iterator, total=num_samples, desc=f"Calculating Workspace ({num_samples} samples)")
-            
-            for status, result_dict in results_iterator:
-                if status == "success":
-                    reachable_points_data.append(result_dict)
-                else:
-                    fail_counts[status] += 1
-    else:
-        iterator = tasks
-        if use_tqdm:
-            iterator = tqdm(iterator, desc=f"Calculating Workspace ({num_samples} samples, Serial)")
-        for task in iterator:
-            status, result_dict = worker_solve_single_point(task)
-            if status == "success":
-                reachable_points_data.append(result_dict)
-            else:
-                fail_counts[status] += 1
-    
-    if use_tqdm:
-        print("\n--- Analysis Complete ---")
-        if num_samples > 0:
-            success_rate = len(reachable_points_data) / num_samples * 100
-            print(f"Success rate: {success_rate:.2f}% ({len(reachable_points_data)}/{num_samples})")
-        print(f"Failure counts: Solver failed = {fail_counts['solver_fail']}, Kinematics failed = {fail_counts['kin_fail']}")
+    all_reachable_points_data = []
+    num_cpus = multiprocessing.cpu_count()
+    print(f"[Homotopy] Starting path tracing with {len(tasks)} paths on {max(1, num_cpus - 1)} processes.")
 
-    return reachable_points_data
+    with multiprocessing.Pool(processes=max(1, num_cpus - 1)) as pool:
+        results_iterator = pool.imap_unordered(trace_single_path, tasks)
+        for path_points in tqdm(results_iterator, total=len(tasks), desc="Tracing Homotopy Paths"):
+            all_reachable_points_data.extend(path_points)
+
+    print("\n--- Analysis Complete ---")
+    print(f"Generated {len(all_reachable_points_data)} points from {len(tasks)} paths.")
+    return all_reachable_points_data
 
 def plot_workspace_3_view(points, output_filename, slice_width=0.01):
+    # (This function remains the same as before)
     if points is None or len(points) < 1:
         print("Warning: Not enough points to plot workspace.")
         return
@@ -129,50 +115,21 @@ def plot_workspace_3_view(points, output_filename, slice_width=0.01):
 
     print(f"\nPlotting workspace 3-view... Saving to '{output_filename}'")
     fig = plt.figure(figsize=(14, 21))
-    fig.suptitle('Workspace Analysis (Pretension Continuation)', fontsize=16)
+    fig.suptitle('Workspace Analysis (Homotopy Path Generator)', fontsize=16)
 
     ws_x, ws_y, ws_z = points[:, 0], points[:, 1], points[:, 2]
 
-    # ... (Plotting code is identical to before) ...
     ax3d = fig.add_subplot(3, 2, 1, projection='3d')
-    ax3d.scatter(ws_x, ws_y, ws_z, c='c', marker='.', s=2, alpha=0.3, label='Workspace')
+    ax3d.scatter(ws_x, ws_y, ws_z, c='b', marker='.', s=5, alpha=0.4, label='Workspace')
     ax3d.set_title('3D View')
     ax3d.set_xlabel('X (m)'); ax3d.set_ylabel('Y (m)'); ax3d.set_zlabel('Z (m)')
     ax3d.legend(); ax3d.axis('equal')
 
-    ax_xy = fig.add_subplot(3, 2, 2)
-    ax_xy.scatter(ws_x, ws_y, c='c', marker='.', s=2, alpha=0.3)
-    ax_xy.set_title('XY Plane Projection')
-    ax_xy.set_xlabel('X (m)'); ax_xy.set_ylabel('Y (m)')
-    ax_xy.grid(True); ax_xy.axis('equal')
-
-    ax_xz = fig.add_subplot(3, 2, 3)
-    ax_xz.scatter(ws_x, ws_z, c='c', marker='.', s=2, alpha=0.3)
-    ax_xz.set_title('XZ Plane Projection')
-    ax_xz.set_xlabel('X (m)'); ax_xz.set_ylabel('Z (m)')
-    ax_xz.grid(True); ax_xz.axis('equal')
-
-    ax_yz = fig.add_subplot(3, 2, 4)
-    ax_yz.scatter(ws_y, ws_z, c='c', marker='.', s=2, alpha=0.3)
-    ax_yz.set_title('YZ Plane Projection')
-    ax_yz.set_xlabel('Y (m)'); ax_yz.set_ylabel('Z (m)')
-    ax_yz.grid(True); ax_yz.axis('equal')
-
-    ax_slice_y0 = fig.add_subplot(3, 2, 5)
-    slice_y0_points = points[np.abs(points[:, 1]) < slice_width]
-    if len(slice_y0_points) > 0:
-        ax_slice_y0.scatter(slice_y0_points[:, 0], slice_y0_points[:, 2], c='m', marker='.', s=5, alpha=0.5)
-    ax_slice_y0.set_title(f'Cross-Section at Y=0 (slice width {slice_width*2:.2f}m)')
-    ax_slice_y0.set_xlabel('X (m)'); ax_slice_y0.set_ylabel('Z (m)')
-    ax_slice_y0.grid(True); ax_slice_y0.axis('equal')
-
-    ax_slice_x0 = fig.add_subplot(3, 2, 6)
-    slice_x0_points = points[np.abs(points[:, 0]) < slice_width]
-    if len(slice_x0_points) > 0:
-        ax_slice_x0.scatter(slice_x0_points[:, 1], slice_x0_points[:, 2], c='m', marker='.', s=5, alpha=0.5)
-    ax_slice_x0.set_title(f'Cross-Section at X=0 (slice width {slice_width*2:.2f}m)')
-    ax_slice_x0.set_xlabel('Y (m)'); ax_slice_y0.set_ylabel('Z (m)')
-    ax_slice_x0.grid(True); ax_slice_x0.axis('equal')
+    ax_xy = fig.add_subplot(3, 2, 2); ax_xy.scatter(ws_x, ws_y, c='b', marker='.', s=5, alpha=0.4); ax_xy.set_title('XY Plane'); ax_xy.set_xlabel('X (m)'); ax_xy.set_ylabel('Y (m)'); ax_xy.grid(True); ax_xy.axis('equal')
+    ax_xz = fig.add_subplot(3, 2, 3); ax_xz.scatter(ws_x, ws_z, c='b', marker='.', s=5, alpha=0.4); ax_xz.set_title('XZ Plane'); ax_xz.set_xlabel('X (m)'); ax_xz.set_ylabel('Z (m)'); ax_xz.grid(True); ax_xz.axis('equal')
+    ax_yz = fig.add_subplot(3, 2, 4); ax_yz.scatter(ws_y, ws_z, c='b', marker='.', s=5, alpha=0.4); ax_yz.set_title('YZ Plane'); ax_yz.set_xlabel('Y (m)'); ax_yz.set_ylabel('Z (m)'); ax_yz.grid(True); ax_yz.axis('equal')
+    ax_slice_y0 = fig.add_subplot(3, 2, 5); slice_y0_points = points[np.abs(points[:, 1]) < slice_width]; ax_slice_y0.scatter(slice_y0_points[:, 0], slice_y0_points[:, 2], c='m', marker='.', s=10, alpha=0.6); ax_slice_y0.set_title(f'Y=0 Cross-Section'); ax_slice_y0.set_xlabel('X (m)'); ax_slice_y0.set_ylabel('Z (m)'); ax_slice_y0.grid(True); ax_slice_y0.axis('equal')
+    ax_slice_x0 = fig.add_subplot(3, 2, 6); slice_x0_points = points[np.abs(points[:, 0]) < slice_width]; ax_slice_x0.scatter(slice_x0_points[:, 1], slice_x0_points[:, 2], c='m', marker='.', s=10, alpha=0.6); ax_slice_x0.set_title(f'X=0 Cross-Section'); ax_slice_x0.set_xlabel('Y (m)'); ax_slice_x0.set_ylabel('Z (m)'); ax_slice_x0.grid(True); ax_slice_x0.axis('equal')
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_filename, dpi=200)
@@ -180,16 +137,20 @@ def plot_workspace_3_view(points, output_filename, slice_width=0.01):
     plt.close(fig)
 
 if __name__ == '__main__':
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
+    
     start_time = time.time()
     
-    num_samples = 500
-    print(f"--- Starting Workspace Analysis (Pretension Continuation, {num_samples} random samples) ---")
-    
-    workspace_full_data = run_workspace_analysis(num_samples=num_samples)
+    # Total points = (4+4+4+8) paths * 20 steps/path = 400 points
+    workspace_full_data = run_workspace_analysis_homotopy(num_steps_per_path=20)
     
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_filename = os.path.join(project_root, 'plots', f'workspace_points_pretension_continuation_{num_samples}.npy')
-    output_plot_filename = f'plots/workspace_plot_pretension_continuation_{num_samples}.png'
+    num_points = len(workspace_full_data)
+    data_filename = os.path.join(project_root, 'plots', f'workspace_points_homotopy_{num_points}.npy')
+    output_plot_filename = f'plots/workspace_plot_homotopy_{num_points}.png'
     os.makedirs(os.path.dirname(data_filename), exist_ok=True)
     
     if workspace_full_data:
