@@ -66,23 +66,41 @@ def calculate_drive_mapping(q_6d, params):
 
     return np.concatenate([delta_s, delta_l])
 
-def calculate_elastic_potential_energy(q_6d, params):
-    kp, _, kc1, _, kc2, _ = q_6d
-    Lp = params['Geometry']['PSS_initial_length']
-    Lc1 = params['Geometry']['CMS_proximal_length']
-    Lc2 = params['Geometry']['CMS_distal_length']
-    K_bending_pss = params['Stiffness']['pss_total_equivalent_bending_stiffness']
-    K_bending_cms = params['Stiffness']['cms_bending_stiffness']
+def calculate_elastic_potential_energy(q, params):
+    """
+    Calculates the total elastic potential energy of the Cosserat rod.
+    """
+    stiffness_params = params['Stiffness']
+    K_bending_pss = stiffness_params['pss_total_equivalent_bending_stiffness']
+    K_bending_cms = stiffness_params['cms_bending_stiffness']
+
+    geo_params = params['Geometry']
+    L_pss, L_cms1, L_cms2 = geo_params['PSS_initial_length'], geo_params['CMS_proximal_length'], geo_params['CMS_distal_length']
     
-    U_pss_bending = 0.5 * K_bending_pss * Lp * kp**2
-    U_cms1_bending = 0.5 * K_bending_cms * Lc1 * kc1**2
-    U_cms2_bending = 0.5 * K_bending_cms * Lc2 * kc2**2
+    cosserat_params = params['Cosserat']
+    n_pss, n_cms1, n_cms2 = cosserat_params['num_elements_pss'], cosserat_params['num_elements_cms1'], cosserat_params['num_elements_cms2']
 
-    # --- new balance term ---
-    k_balance = params['Stiffness'].get('cms_balance_coeff', 0.0)
-    U_balance = 0.5 * k_balance * (kc1 - kc2)**2
+    ds_pss = L_pss / n_pss
+    ds_cms1 = L_cms1 / n_cms1
+    ds_cms2 = L_cms2 / n_cms2
 
-    return U_pss_bending + U_cms1_bending + U_cms2_bending + U_balance
+    U = 0.0
+    # PSS segment
+    for i in range(n_pss):
+        kappa_i = q[:, i]
+        U += 0.5 * K_bending_pss * np.dot(kappa_i, kappa_i) * ds_pss
+    
+    # CMS proximal segment
+    for i in range(n_pss, n_pss + n_cms1):
+        kappa_i = q[:, i]
+        U += 0.5 * K_bending_cms * np.dot(kappa_i, kappa_i) * ds_cms1
+
+    # CMS distal segment
+    for i in range(n_pss + n_cms1, n_pss + n_cms1 + n_cms2):
+        kappa_i = q[:, i]
+        U += 0.5 * K_bending_cms * np.dot(kappa_i, kappa_i) * ds_cms2
+
+    return U
 
 def calculate_gravity_potential_energy(q_6d, params):
     g = params['Mass']['g']

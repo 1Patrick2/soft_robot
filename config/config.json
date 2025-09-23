@@ -10,6 +10,20 @@
         "long_lines": {
             "diameter_m": 0.007,
             "angles_deg": [45, 135, 225, 315]
+        },
+        "anchor_points_base": {
+            "short": [
+                [0.0025, 0.0, 0.0],
+                [0.0, 0.0025, 0.0],
+                [-0.0025, 0.0, 0.0],
+                [0.0, -0.0025, 0.0]
+            ],
+            "long": [
+                [0.00247487, 0.00247487, 0.0],
+                [-0.00247487, 0.00247487, 0.0],
+                [-0.00247487, -0.00247487, 0.0],
+                [0.00247487, -0.00247487, 0.0]
+            ]
         }
     },
     "Mass": {
@@ -36,7 +50,29 @@
     },
     "Drive_Properties": {
         "cable_stiffness": 3500.0,
-        "pretension_force_N": 0.3
+        "pretension_force_N": 0.3,
+        "long_cable_cms1_effectiveness": 0.3,
+        "gamma_cms1_short": 2.0,
+        "gamma_cms1_long": 0.5,
+        "gamma_cms2_long": 1.0,
+        "alpha_z_short": 0.2,
+        "eta_coupling": 0.1,
+        "alpha_z_tip": 0.2,
+        "long_cable_cms1_weight": 0.4,
+        "beta_sag_correction": 0.01,
+        "cable_groups": {
+            "short": {
+                "indices": [0, 1, 2, 3],
+                "range": "pss+cms1"
+            },
+            "long": {
+                "indices": [4, 5, 6, 7],
+                "range": "pss+cms1+cms2"
+            }
+        }
+    },
+    "Regularization": {
+        "lambda": 1e-6
     },
     "Solver": {
       "pos_tol_m": 0.01,
@@ -66,5 +102,10 @@
     "ModelOptions": {
       "cable_anchor_mode": "base",
       "cable_anchor_blend": 0.95
+    },
+    "Cosserat": {
+      "num_elements_pss": 10,
+      "num_elements_cms1": 20,
+      "num_elements_cms2": 20
     }
 }

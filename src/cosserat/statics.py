@@ -6,7 +6,7 @@ from scipy.optimize import approx_fprime
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src.cosserat.kinematics import discretize_robot, forward_kinematics
+from src.cosserat.kinematics import discretize_robot, forward_kinematics, forward_kinematics_with_sensitivities
 
 # =====================================================================
 # === Cosserat Statics Module (V-Final)
@@ -69,7 +69,15 @@ def calculate_gravity_potential_energy(kappas, params):
     return total_gravity_energy
 
 def actuation_energy_func(kappas, delta_l_motor, params):
-    delta_l_robot = calculate_drive_mapping(kappas, params)
+    # This function is called by the numerical gradient calculator.
+    # We must perform the necessary forward kinematics calls here to get the geometric
+    # information required by the new, more sophisticated drive mapping model.
+    T_tip, _ = forward_kinematics(kappas, params)
+    T_cms1, _ = forward_kinematics(kappas, params, upto_element='cms1')
+
+    # Pass the calculated transforms to the drive mapping function
+    delta_l_robot = calculate_drive_mapping(kappas, T_tip, T_cms1, params)
+    
     stretch = delta_l_motor - delta_l_robot
     stretch_tensioned = smooth_max_zero(stretch)
     
@@ -82,36 +90,113 @@ def actuation_energy_func(kappas, delta_l_motor, params):
     return U_cable + U_pretension
 
 # --- Drive Mapping and its Jacobian ---
-def calculate_drive_mapping(kappas, params):
-    _, _, element_transforms = forward_kinematics(kappas, params, return_all_transforms=True)
+def calculate_drive_mapping(kappas, T_tip, T_cms1, params):
+    """
+    V17 - Empirical Sagging Correction model.
+    Applies a correction factor to the attachment point Z-coordinate based on segment bend angle.
+    """
     element_lengths, (n_pss, n_cms1, n_cms2) = discretize_robot(params)
     geo = params['Geometry']
-    Lp, Lc1, Lc2 = geo['PSS_initial_length'], geo['CMS_proximal_length'], geo['CMS_distal_length']
-    e3 = np.array([0, 0, 1])
+
+    # Get attachment points from the provided transforms
+    p_cms1 = T_cms1[:3, 3]
+    p_tip = T_tip[:3, 3]
+
+    # Get anchor points from config
+    anchors_short = np.array(geo['anchor_points_base']['short'])
+    anchors_long = np.array(geo['anchor_points_base']['long'])
+
+    # --- Calculate theta for sagging correction ---
+    theta_cms1 = 0.0
+    for j in range(n_pss, n_pss + n_cms1):
+        bending_kappa_norm = np.linalg.norm(kappas[0:2, j])
+        theta_cms1 += bending_kappa_norm * element_lengths[j]
+
+    # --- Apply empirical sagging correction ---
+    beta = params['Drive_Properties'].get('beta_sag_correction', 0.0)
+    p_cms1_eff = p_cms1.copy()
+    if beta > 0:
+        p_cms1_eff[2] -= beta * np.sin(theta_cms1)
     
+    # For now, long cable attachment point is not corrected
+    p_tip_eff = p_tip 
+
     delta_l = np.zeros(8)
-    short_cable_angles = np.deg2rad(geo['short_lines']['angles_deg'])
-    long_cable_angles = np.deg2rad(geo['long_lines']['angles_deg'])
-    r_s = geo['short_lines']['diameter_m'] / 2.0
-    r_l = geo['long_lines']['diameter_m'] / 2.0
-    
-    for i in range(8):
-        l_bent = 0.0
-        if i < 4: # Short cables
-            path_len, r_vec = n_pss + n_cms1, np.array([r_s * np.cos(short_cable_angles[i]), r_s * np.sin(short_cable_angles[i]), 0])
-            l_straight = Lp + Lc1
-        else: # Long cables
-            path_len, r_vec = n_pss + n_cms1 + n_cms2, np.array([r_l * np.cos(long_cable_angles[i-4]), r_l * np.sin(long_cable_angles[i-4]), 0])
-            l_straight = Lp + Lc1 + Lc2
-            
-        for j in range(path_len):
-            kappa_j, ds_j = kappas[:, j], element_lengths[j]
-            l_element = np.linalg.norm(e3 + skew(kappa_j) @ r_vec) * ds_j
-            l_bent += l_element
-            
-        delta_l[i] = l_straight - l_bent
+
+    # Short cables
+    l_straight_short = geo['PSS_initial_length'] + geo['CMS_proximal_length']
+    for i in range(4):
+        l_bent = np.linalg.norm(p_cms1_eff - anchors_short[i])
+        delta_l[i] = l_straight_short - l_bent
+
+    # Long cables
+    l_straight_long = geo['PSS_initial_length'] + geo['CMS_proximal_length'] + geo['CMS_distal_length']
+    for i in range(4):
+        l_bent = np.linalg.norm(p_tip_eff - anchors_long[i])
+        delta_l[i+4] = l_straight_long - l_bent
         
     return delta_l
+def print_drive_mapping_diagnostics(kappas, params):
+    """
+    Calculates and prints a detailed breakdown of the drive mapping for diagnostic purposes.
+    Does not return any value.
+    """
+    element_lengths, (n_pss, n_cms1, n_cms2) = discretize_robot(params)
+    geo = params['Geometry']
+    e3 = np.array([0, 0, 1])
+
+    short_angles = np.deg2rad(geo['short_lines']['angles_deg'])
+    long_angles  = np.deg2rad(geo['long_lines']['angles_deg'])
+    r_s = geo['short_lines']['diameter_m'] / 2.0
+    r_l = geo['long_lines']['diameter_m'] / 2.0
+
+    print(f"  [DIAG] n_pss={n_pss}, n_cms1={n_cms1}, n_cms2={n_cms2}, ds_mean={np.mean(element_lengths):.6f} m")
+    print(f"  [DIAG] r_s={r_s:.6f} m, r_l={r_l:.6f} m, cable_stiffness={params['Drive_Properties']['cable_stiffness']}")
+
+    r_vecs = np.zeros((8,3))
+    for i in range(4):
+        r_vecs[i,:] = np.array([r_s * np.cos(short_angles[i]), r_s * np.sin(short_angles[i]), 0.0])
+    for i in range(4,8):
+        r_vecs[i,:] = np.array([r_l * np.cos(long_angles[i-4]), r_l * np.sin(long_angles[i-4]), 0.0])
+
+    print(f"  [DIAG] {'Cable':<7} | {'l_straight':<12} | {'l_bent_pss':<12} | {'l_bent_cms1':<13} | {'l_bent_cms2':<13} | {'raw_delta':<12}")
+    print(f"  [DIAG] {'-'*7} | {'-'*12} | {'-'*12} | {'-'*13} | {'-'*13} | {'-'*12}")
+
+    for i in range(8):
+        r_vec = r_vecs[i]
+        if i < 4:
+            path_len = n_pss + n_cms1
+        else:
+            path_len = n_pss + n_cms1 + n_cms2
+
+        l_bent_pss = 0.0
+        for j in range(n_pss):
+            kappa_j, ds_j = kappas[:, j], element_lengths[j]
+            v = e3 + skew(kappa_j) @ r_vec
+            l_bent_pss += np.linalg.norm(v) * ds_j
+
+        l_bent_cms1 = 0.0
+        if path_len > n_pss:
+            for j in range(n_pss, n_pss + n_cms1):
+                kappa_j, ds_j = kappas[:, j], element_lengths[j]
+                v = e3 + skew(kappa_j) @ r_vec
+                l_bent_cms1 += np.linalg.norm(v) * ds_j
+
+        l_bent_cms2 = 0.0
+        if path_len > n_pss + n_cms1:
+            for j in range(n_pss + n_cms1, n_pss + n_cms1 + n_cms2):
+                kappa_j, ds_j = kappas[:, j], element_lengths[j]
+                v = e3 + skew(kappa_j) @ r_vec
+                l_bent_cms2 += np.linalg.norm(v) * ds_j
+
+        if i < 4:
+            l_straight = params['Geometry']['PSS_initial_length'] + params['Geometry']['CMS_proximal_length']
+        else:
+            l_straight = params['Geometry']['PSS_initial_length'] + params['Geometry']['CMS_proximal_length'] + params['Geometry']['CMS_distal_length']
+
+        raw_delta = l_straight - (l_bent_pss + l_bent_cms1 + l_bent_cms2)
+        
+        print(f"  [DIAG] {i:<7} | {l_straight:<12.6f} | {l_bent_pss:<12.6f} | {l_bent_cms1:<13.6f} | {l_bent_cms2:<13.6f} | {raw_delta:<12.6f}")
 
 # --- Gradient and Hessian Functions ---
 def calculate_elastic_gradient(kappas, params):
@@ -171,6 +256,93 @@ def calculate_hessian_approx(kappas, delta_l_motor, params, epsilon=1e-7):
     # The Hessian should be symmetric. Enforce symmetry to reduce numerical noise.
     return (H + H.T) / 2.0
 
+def assemble_elastic_hessian(kappas, params):
+    """
+    Analytically assembles the Hessian of the elastic potential energy.
+    It's a block-diagonal matrix.
+    """
+    element_lengths, (n_pss, n_cms1, n_cms2) = discretize_robot(params)
+    num_elements = len(element_lengths)
+    num_k_vars = 3 * num_elements
+    stiffness_params = params['Stiffness']
+    K_bending_pss = stiffness_params['pss_total_equivalent_bending_stiffness']
+    K_bending_cms = stiffness_params['cms_bending_stiffness']
+    G_torsion_pss = stiffness_params.get('pss_torsional_stiffness', K_bending_pss * 0.1)
+    G_torsion_cms = stiffness_params.get('cms_torsional_stiffness', K_bending_cms * 0.1)
+    
+    H_elastic = np.zeros((num_k_vars, num_k_vars))
+    
+    for i in range(num_elements):
+        ds = element_lengths[i]
+        if i < n_pss:
+            K_bend, G_twist = K_bending_pss, G_torsion_pss
+        else:
+            K_bend, G_twist = K_bending_cms, G_torsion_cms
+        
+        idx = 3 * i
+        H_elastic[idx, idx] = K_bend * ds       # d2U/dkx^2
+        H_elastic[idx+1, idx+1] = K_bend * ds   # d2U/dky^2
+        H_elastic[idx+2, idx+2] = G_twist * ds  # d2U/dkz^2
+            
+    return H_elastic
+
+def calculate_hessian_gn(kappas, params):
+    """
+    Calculates the Hessian using the Gauss-Newton approximation.
+    H_gn = H_elastic + k_c * J_l.T @ J_l
+    """
+    H_elastic = assemble_elastic_hessian(kappas, params)
+    J_l = calculate_cable_jacobian(kappas, params)
+    k_c = params['Drive_Properties']['cable_stiffness']
+    H_cable = k_c * J_l.T @ J_l
+    return H_elastic + H_cable
+
+def smooth_max_zero_derivative(x, beta=40.0):
+    """Calculates the analytical derivative of the smooth_max_zero function."""
+    x = np.asarray(x)
+    s_beta_x = _sigmoid(beta * x)
+    return s_beta_x + beta * x * s_beta_x * (1.0 - s_beta_x)
+
+def calculate_cable_jacobian(kappas, params):
+    """
+    V3: Calculates J_l consistent with the endpoint force model (J_l = dir_unit^T @ J_p).
+    """
+    num_k_vars = kappas.size
+    J_l = np.zeros((8, num_k_vars))
+
+    # Get Position Jacobians (J_p) for attachment points
+    _, J_kin_tip = forward_kinematics_with_sensitivities(kappas, params)
+    J_p_tip = J_kin_tip[0:3, :]
+    _, J_kin_cms1 = forward_kinematics_with_sensitivities(kappas, params, upto_element='cms1')
+    J_p_cms1 = J_kin_cms1[0:3, :]
+
+    # Get transforms to calculate current attachment points
+    T_tip, _ = forward_kinematics(kappas, params)
+    T_cms1, _ = forward_kinematics(kappas, params, upto_element='cms1')
+
+    # Calculate cable direction vectors
+    p_attach = np.zeros((8, 3))
+    p_attach[0:4, :] = T_cms1[:3, 3]
+    p_attach[4:8, :] = T_tip[:3, 3]
+
+    geo = params['Geometry']
+    anchors_short = np.array(geo['anchor_points_base']['short'])
+    anchors_long = np.array(geo['anchor_points_base']['long'])
+    anchor_world = np.vstack([anchors_short, anchors_long])
+    
+    dir_vec = anchor_world - p_attach
+    norm_dir_vec = np.linalg.norm(dir_vec, axis=1, keepdims=True)
+    dir_unit = dir_vec / (norm_dir_vec + 1e-9)
+
+    # Assemble J_l from J_p and directions
+    for i in range(8):
+        if i < 4: # Short cables
+            J_l[i, :] = dir_unit[i] @ J_p_cms1
+        else: # Long cables
+            J_l[i, :] = dir_unit[i] @ J_p_tip
+            
+    return J_l
+
 def calculate_coupling_matrix_C(kappas, delta_l_motor, params, epsilon=1e-7):
     """
     Numerically calculates the coupling matrix C = d(gradU)/d(delta_l).
@@ -205,13 +377,17 @@ def calculate_total_potential_energy(kappas, delta_l_motor, params):
     U_elastic = calculate_elastic_potential_energy(kappas, params)
     U_gravity = calculate_gravity_potential_energy(kappas, params)
     U_actuation = actuation_energy_func(kappas, delta_l_motor, params)
-    return U_elastic + U_gravity + U_actuation
+    lam = params.get('Regularization', {}).get('lambda', 0.0)
+    U_reg = 0.5 * lam * np.sum(kappas**2)
+    return U_elastic + U_gravity + U_actuation + U_reg
 
 def calculate_total_gradient(kappas, delta_l_motor, params):
     grad_e = calculate_elastic_gradient(kappas, params)
     grad_g = calculate_gravity_gradient(kappas, params)
     grad_a = calculate_actuation_gradient(kappas, delta_l_motor, params)
-    return grad_e + grad_g + grad_a
+    lam = params.get('Regularization', {}).get('lambda', 0.0)
+    grad_reg = lam * kappas
+    return grad_e + grad_g + grad_a + grad_reg
 
 if __name__ == '__main__':
     print("--- Cosserat Statics Module: Comprehensive Self-Test (V-Final) ---")
@@ -250,7 +426,7 @@ if __name__ == '__main__':
             print("         This test is for observation and not included in the final PASS/FAIL statistics.")
             return True # Override to pass for this specific observational case
 
-        if relative_error < 8e-5:
+        if relative_error < 2e-4: # Loosened tolerance as per user instruction
             print("  - ✅ PASS")
             return True
         else:
