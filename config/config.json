@@ -33,8 +33,10 @@
         "cms_distal_kg": 0.01
     },
     "Stiffness": {
-        "pss_total_equivalent_bending_stiffness": 23.0,
-        "cms_bending_stiffness": 0.05,
+        "pss_total_equivalent_bending_stiffness": 20.0,
+        "cms_bending_stiffness_base": 0.025,
+        "cms_bending_stiffness_nonlinear": 0.0,
+        "geometric_stiffness_coeff": 0.01,
         "cms_balance_coeff": 0.1
     },
     "Initial_State": {
@@ -49,8 +51,13 @@
         ]
     },
     "Drive_Properties": {
-        "cable_stiffness": 3500.0,
+        "cable_stiffness": 6000.0,
         "pretension_force_N": 0.3,
+        "gamma_cms2_short": 0.0,
+        "gamma_1_base": 0.1,
+        "gamma_1_tip": 5.0,
+        "gamma_2": 1.0,
+        "effective_radius_scale": 2.1,
         "long_cable_cms1_effectiveness": 0.3,
         "gamma_cms1_short": 2.0,
         "gamma_cms1_long": 0.5,
@@ -59,11 +66,12 @@
         "eta_coupling": 0.1,
         "alpha_z_tip": 0.2,
         "long_cable_cms1_weight": 0.4,
-        "beta_sag_correction": 0.01,
+        "beta_sag_correction": 0.01, 
+        "smooth_max_beta": 50.0,
         "cable_groups": {
             "short": {
                 "indices": [0, 1, 2, 3],
-                "range": "pss+cms1"
+                "range": "cms1"
             },
             "long": {
                 "indices": [4, 5, 6, 7],
@@ -75,6 +83,12 @@
         "lambda": 1e-6
     },
     "Solver": {
+      "solver_method": "minimize", 
+      "weights": {
+          "w_drive_residual": 1000.0,
+          "w_physics_residual": 1.0,
+          "w_pos": 1000.0, "w_ori": 0.5, "w_drive": 1e-4, "w_reg": 1e-4, "w_dl_penalty": 100.0, "w_pos_in_residual": 1.0, "w_ori_in_residual": 1.0, "pos_error_scale": 1000.0, "ori_error_scale": 57.29578
+      },
       "pos_tol_m": 0.01,
       "ori_tol_rad": 0.087266, 
       "hessian_damp_alpha": 1e-3,
@@ -86,8 +100,7 @@
       "pso": {
         "stageA": {"n_particles": 64, "iters": 50},
         "stageB": {"n_particles": 64, "iters": 30}
-      },
-      "weights": {"w_pos": 1000.0, "w_ori": 0.5, "w_drive": 1e-4, "w_reg": 1e-4, "w_dl_penalty": 100.0, "w_pos_in_residual": 1.0, "w_ori_in_residual": 1.0, "pos_error_scale": 1000.0, "ori_error_scale": 57.29578}
+      }
     },
     "Bounds": {
         "delta_l_bounds": [-0.12, 0.12],
@@ -100,12 +113,13 @@
         }
     },
     "ModelOptions": {
+      "drive_map_model": "projection_driven",
       "cable_anchor_mode": "base",
       "cable_anchor_blend": 0.95
     },
     "Cosserat": {
-      "num_elements_pss": 10,
-      "num_elements_cms1": 20,
-      "num_elements_cms2": 20
+      "num_elements_pss": 8,
+      "num_elements_cms1": 8,
+      "num_elements_cms2": 6
     }
 }

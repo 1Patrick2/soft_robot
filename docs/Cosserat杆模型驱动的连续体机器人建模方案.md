@@ -1,500 +1,359 @@
-## **文档修订准则 (Document Revision Standard)**
+# **V-Cosserat Sim2Real：一种基于Cosserat杆理论的高保真建模、推导与实现方案 (V3.0 - 深度解析版)**
 
-1.  **核心方案 (Core Design):** 本文档是项目的核心物理模型和数学方案的**唯一权威来源 (Single Source of Truth)**。
-2.  **演进式更新 (Evolutionary Updates):** 本文档记录了从早期探索到最终方案的设计演进，通过**注释和保留旧方案**的方式，为未来的迭代提供了宝贵的历史参考。
-3.  **代码同步 (Code Synchronization):** 本文档中描述的最终方案，与代码库中 `V-Final` 版本的 `statics.py`, `solver.py`, `outer_solver.py` 等核心模块的实现**严格保持一致**。
+## **目录**
 
-
-
-
-# V-Cosserat：从原理到实现的逐步推导与数值方案
-
-## 目录（快速导航）
-
-1.  概览与基本假设
+1.  概览与目标
+2+. 实际机器人构型和参数
 2.  Cosserat 基本方程（连续形式）
-3.  构型与变量离散化（从连续到数值）
-4.  正运动学（数值积分 RK4）及灵敏度方程（变分方程）
-5.  缆绳路径与长度映射的严格推导
-6.  总势能与能量项逐项导出（并给出其对离散参数的梯度）
-7.  雅可比 / 海森（Hessian）推导与高效近似（Gauss-Newton）
-8.  隐函数定理求解任务雅可比（J\_task）的严格推导
-9.  数值方案与算法伪代码（内循环、外循环、warm-start/homotopy）
-10. 实现细节、复杂度与参数建议
+3.  离散化与数值变量
+4.  正运动学与灵敏度方程
+5.  缆绳路径与长度映射（积分模型 V2.1）
+6.  能量函数与梯度/海森推导
+7.  外循环雅可比：隐函数定理的严格推导
+8.  Sim2Real 建模与参数校正流程
+9.  数值方案与算法伪代码
+10. 工程实现与关键物理效应分析
 
------
+---
 
-## 1\. 概览与基本假设
+## **1. 概览与目标**
 
-  * **目标**：用 Cosserat Rod 建模三段串联连续体（PSS, CMS1, CMS2），使模型能真实反映沿长方向曲率分布以及缆线路径随构型变化的影响，从而避免 PCC 的覆盖限制与病态分布问题。
-  * **假设**（为了实用性）：各段可近似为不可伸长、可弯曲且可以扭转的细杆（inextensible Cosserat rod）；截面刚性足够，截面不随弯曲扭曲改变（刚性截面假设）。
-  * **变量**：以弧长 $s$ 为自变量，定义在每个段的区间上；力学变量包括位置 $p(s)$、旋转矩阵 $R(s)$、内力 $n(s)$、内力矩 $m(s)$、曲率向量 $\\kappa(s)$。
+*   **核心目标**：在Cosserat杆理论框架下，为一种由近端高刚度直杆段（PSS）与远端低刚度柔性段（CMS1/2）串联构成的索驱动连续体机器人，构建一个**物理上完备、数学上严谨、且可用于高精度Sim2Real校准**的静力学模型。最终目标是使仿真模型的预测（如驱动-位姿响应曲线）能够与物理实验数据高度吻合。
 
-## 2\. Cosserat 连续方程（连续形式，推导基础）
+*   **技术选型背景**：项目早期采用的“分段常曲率（PCC）”模型，其内在的几何强约束使其无法准确描述由外力（如重力）和复杂驱动共同作用下产生的非均匀曲率变形，导致仿真工作空间与现实严重不符。为克服此局限，我们转向表达能力更强、物理基础更坚实的**Cosserat杆模型**。该模型将杆视为一个连续的、带方向的介质，能够统一处理拉伸、剪切、弯曲和扭转。
 
-### 2.1 运动学：旋转与位置关系
+*   **基本假设**：为在保证模型精度的前提下简化问题，我们采纳机器人学中对细长杆的两个标准假设：
+    *   **不可伸长性 (Inextensibility)**：杆的中心线在变形过程中弧长保持不变。这是Cosserat模型的基础，数学上表现为位置对弧长的导数向量模长恒为1。
+    *   **刚性横截面 (Rigid Cross-section)**：杆的横截面在弯曲和扭转时自身不发生形变，仅作为刚体随中心线进行平移和旋转。
 
-定义局部基 ${d\_1(s), d\_2(s), d\_3(s)}$ 作为杆截面在全局坐标系下的方向，收集为旋转矩阵 $R(s) = [d\_1, d\_2, d\_3] \\in SO(3)$。弧长变量 $s\\in[0,L]$。
+*   **校正约束与优化哲学**：
+    *   **不可变量**：机器人的宏观几何参数（如段长、缆绳孔径和角度）是根据设计图纸确定的真值，在校准中应保持不变。
+    *   **弱可变参数**：结构刚度参数（`pss_bending_stiffness`, `cms_bending_stiffness`）是材料的固有属性，仅允许在基于材料手册的理论值附近小范围调整，以匹配真实的物理特性。
+    *   **核心优化变量**：我们深刻认识到，仿真与现实的核心差异源于**驱动系统的等效物理模型**。因此，校准的重点必须放在`Drive_Properties`中的参数，尤其是**`effective_radius_scale` (有效半径缩放)** 和 **`gamma_*` (几何增益)**。这些参数被设计用来吸收和补偿所有未在模型中显式表达的非理想效应，如摩擦、滑轮的等效力臂、缆绳与通道的接触等。
 
-微分几何关系：
+---
+明白 ✅。你这版 **V3.0 深度解析**已经完整建立了 **Cosserat 框架 + Sim2Real 流程**，但是确实还没有结合你的 **实际构型**（PSS/CMS 长度、刚度、质量、缆绳布置、锚点等数据）。
+我可以帮你把这些内容整理进文档的相应章节，补充成 **V3.1 含构型实例版**。
 
-$$
-\frac{dR}{ds} = R \,\widehat{\kappa}(s)
-\qquad
-\frac{dp}{ds} = R e_3 \quad(\text{inextensible: } \|dp/ds\|=1)
-$$其中 $e\_3 = (0,0,1)^\\top$ 表示局部轴（杆沿局部 z 轴方向伸长），$\\widehat{\\kappa}$ 是曲率—扭转向量 $\\kappa=(\\kappa\_x,\\kappa\_y,\\kappa\_z)^\\top$ 的反对称矩阵表示：
+我会在 **1. 概览与目标** 和 **3. 离散化与数值变量** 之间，增加一个新的章节：
 
-$$\\widehat{\\kappa} =
-\\begin{bmatrix}
-0      & -\\kappa\_z & \\kappa\_y \\
-\\kappa\_z & 0       & -\\kappa\_x \\
-\-\\kappa\_y & \\kappa\_x & 0
-\\end{bmatrix}
-$$\> 注：若忽略扭转，可将 $\\kappa\_z\\approx 0$。
+---
 
-### 2.2 力平衡 / 力矩平衡（静态平衡形式）
+## **2+. 实际机器人构型与参数**
 
-静力平衡（无体力分布项或有重力）：
+以下数据来自你的工程 JSON 配置与实验情况：
 
-$$
-\frac{dn}{ds} + f_{ext}(s) = 0
-$$$$
-\frac{dm}{ds} + \frac{dp}{ds}\times n + l_{ext}(s) = 0
-$$其中 $f\_{ext}$ 是分布外力密度（例如重力和链索对节点的分布作用），$l\_{ext}$ 是分布外力矩密度（通常为0）。
+### **段落划分与长度**
 
-### 2.3 本构关系（线性弹性）
+* **PSS 段**（近端刚性支撑）：
 
-假设线弹性（小应变在杆截面上成立），内力矩和曲率的线性关系：
+  * 长度 $L_{pss} = 0.20\ \text{m}$
+  * 高刚度，近似直杆，弯曲性极弱
+* **CMS1 段**（近端柔性段）：
 
-$$m(s) = B(s),(\\kappa(s) - \\kappa\_0(s))
-$$其中 $B(s)$ 是截面抗弯扭刚度矩阵（对各方向弯曲 / 扭转给出 $EI\_x,EI\_y,GJ$），$\\kappa\_0$ 为预曲率（若无预曲率则 $\\kappa\_0=0$）。
+  * 长度 $L_{cms1} = 0.050\ \text{m}$
+  * 低刚度，可受短缆驱动显著弯曲
+* **CMS2 段**（远端柔性段）：
 
-若允许剪切/伸长：
+  * 长度 $L_{cms2} = 0.050\ \text{m}$
+  * 低刚度，受长缆驱动，同时也会被动受重力和 CMS1 运动耦合影响
 
-$$
-n(s) = S(s)\, (v(s)-v_0(s))
-$$其中 $v(s)=R(s)^\\top p'(s)$ 为剪切/伸长应变；但我们采用不可伸长假设 $v=e\_3$（或只允许小伸长），则通常忽略或将 $n$ 作为约束乘子处理。
+总长 $L_{tot} = 0.30\ \text{m}$，符合实验观测：末端可因弯曲进入 $z<0.20$ m 的范围。
 
-## 3\. 离散化：从连续到可计算的自由度
+### **质量分布**
 
-为实现数值求解，将整杆在弧长上离散为 $N$ 个单元（建议每段 6–12 单元，整个机器人 $N\\approx20–40$，工程上常取 $N\\approx20$）。对离散形式定义：
+* PSS： $m_{pss}=0.03\ \text{kg}$
+* CMS1： $m_{cms1}=0.01\ \text{kg}$
+* CMS2： $m_{cms2}=0.01\ \text{kg}$
 
-* 单元 $i$ 的长度 $\\Delta s\_i$（均匀时 $\\Delta s = L/N$）。
-* 在单元中心或端点定义曲率向量 $\\kappa\_i\\in\\mathbb{R}^3$（工程上常用中心常数近似）。
-* 离散变量向量 $\\mathbf{x} = [\\kappa\_1^\\top, \\kappa\_2^\\top, \\dots, \\kappa\_N^\\top]^\\top \\in \\mathbb{R}^{3N}$；若忽略扭转可用 $2N$ 维（只包含 $\\kappa\_x,\\kappa\_y$）。
+分布质量用于重力势能计算：
+$U_g = \sum_j m_j g \cdot z_{com,j}$
 
-离散化带来数值公式的替代关系：
+### **弯曲刚度**
 
-* 旋转与位置的数值积分（以 RK4 或指数映射组合）可从已知 $R(s\_{i-1}),p(s\_{i-1})$ 对单元 $i$ 应用：
-$$
+* PSS： $B_{pss} = 20.0\ \text{N·m}^2$
+* CMS1/2： $B_{cms} = 0.025\ \text{N·m}^2$
+* 平衡系数： `cms_balance_coeff = 0.1`，用于 CMS1/2 刚度的细调
 
-```
-$$R(s\_i) \\approx R(s\_{i-1}) \\exp(\\widehat{\\kappa\_i}\\Delta s)
-$$
-$$$$
-$$p(s\_i) \\approx p(s\_{i-1}) + \\int\_{0}^{\\Delta s} R(s\_{i-1}) \\exp(\\widehat{\\kappa\_i}\\xi) e\_3 , d\\xi
-$$
-$$积分项可用 RK4 或闭式近似（若 $\\kappa$ 非常小可采用级数展开）。
-```
+→ 刚度比大约 $800:1$，因此 **PSS 可以近似直立**，CMS 段承担主要弯曲。
 
-## 4\. 正运动学（数值积分）与灵敏度（变分）方程 — 逐步推导
+### **缆绳布置与锚点**
 
-### 4.1 RK4 积分（单元推进步骤）
+1. **短缆 (short group, index 0–3)**
 
-给定单元 $i$ 的曲率 $\\kappa\_i$，已知 $R\_{i-1}, p\_{i-1}$，求 $R\_i, p\_i$。
-用 RK4 对 ODE：
+   * 直径：$d = 5\ \text{mm}$，布置角度 [0°, 90°, 180°, 270°]
+   * 基座锚点：
 
-$$
-\dot{R} = R \widehat{\kappa}(s), \quad \dot{p} = R e_3
-$$在单元区间 $[0,\\Delta s]$ 做标准 RK4。实现细节略，但关键是我们能通过 $\\kappa\_i$ 计算出 $R\_i, p\_i$——这就是正运动学。
+     $$
+     \{(2.5,0,0), (0,2.5,0), (-2.5,0,0), (0,-2.5,0)\}\ \text{mm}
+     $$
+   * 作用范围：`pss+cms1`
+   * 实际：止于 **CMS1 段末端**
 
-### 4.2 变分（灵敏度）方程（为什么需要）
+2. **长缆 (long group, index 4–7)**
 
-为了得到能量关于自由度 $\\mathbf{x}$ 的梯度（用于优化器），需要计算：
+   * 直径：$d = 7\ \text{mm}$，布置角度 [45°, 135°, 225°, 315°]
+   * 基座锚点：
 
-* $\\partial p(s) / \\partial \\kappa\_j$
-* $\\partial R(s) / \\partial \\kappa\_j$
+     $$
+     \{(2.47,2.47,0), (-2.47,2.47,0), (-2.47,-2.47,0), (2.47,-2.47,0)\}\ \text{mm}
+     $$
+   * 作用范围：`pss+cms1+cms2`
+   * 实际：止于 **CMS2 段末端**
 
-即：若改变单元 $j$ 的曲率，会如何影响沿杆的旋转与位置？这由线性化方程（变分方程）给出。
 
-### 4.3 推导变分方程（连续形式）
+### **驱动与修正参数**
 
-令对 $\\kappa$ 的微扰为 $\\delta\\kappa(s)$，对应变数为 $\\delta R(s), \\delta p(s)$。从运动学方程线性化：
-起始：
+* 缆绳刚度：$k_c = 3500\ \text{N/m}$
+* 预紧力：$f_{pre} = 0.3\ \text{N}$
+* 有效性参数：
 
-$$\\delta R' = \\delta R ,\\widehat{\\kappa} + R ,\\widehat{\\delta\\kappa}
-$$$$
-\\delta p' = \\delta R , e\_3
-$$将 $\\delta R = R \\widehat{\\eta}$（存在向量 $\\eta(s)$ 使得 $\\delta R = R \\widehat{\\eta}$，这是因为 $T\_{R}SO(3)$ 的切空间表示），代入得：
+  * `gamma_cms1_short = 2.0`（短缆对 CMS1 强作用）
+  * `gamma_cms1_long = 0.5`（长缆对 CMS1 弱作用）
+  * `gamma_cms2_long = 1.0`（长缆主要作用在 CMS2）
+* Tip-Z 修正：`alpha_z_tip = 0.2`
+* 耦合修正：`eta_coupling = 0.1`
 
-$$
-R \widehat{\eta}' = R \widehat{\eta}\widehat{\kappa} + R \widehat{\delta\kappa}
-\Rightarrow
-\widehat{\eta}' = \widehat{\eta}\widehat{\kappa} + \widehat{\delta\kappa}
-$$转换为向量形式（利用向量恒等式）得到：
+--
+---
 
-$$\\eta' = \\delta\\kappa - \\kappa \\times \\eta
-$$同时
+## **2. Cosserat 基本方程（连续形式）**
+
+### **2.1 运动学：位置与姿态的微分几何关系**
+
+我们使用一个随弧长 `s` 变化的右手局部坐标系（即“标架”）来描述杆的瞬时形态。该标架由三个正交单位向量 $\{d_1(s), d_2(s), d_3(s)\}$ 构成，其中 $d_3$ 始终与杆的中心线相切。这三个向量共同构成一个旋转矩阵 $R(s) = [d_1, d_2, d_3] \in SO(3)$，它定义了杆在 `s` 点的姿态。
+
+杆的形状由其中心线的位置 $p(s) \in \mathbb{R}^3$ 和姿态 $R(s)$ 共同描述，它们沿弧长的变化率由局部坐标系下的曲率向量 $\kappa(s) = (\kappa_x, \kappa_y, \kappa_z)^\top$ 控制：
 
 $$
-\delta p' = R \widehat{\eta} e_3 = R (\eta \times e_3)
-$$所以
-
-$$\\delta p(s) = \\int\_0^s R(\\xi) (\\eta(\\xi) \\times e\_3) , d\\xi
-$$这是一组线性常系数（随解变化）ODE，可随主积分一起以数值方法解出 —— 这是\*\*灵敏度方程（tangent linear model）\*\*的连续形式。离散后对每个自由度（单元）只需解一次线性微分方程组，代价与变量数成线性比例（并可以向量化并行化）。
-
-## 5\. 缆绳路径与长度映射（严格推导）
-
-这是本模型的核心：给定杆的形状 $p(s),R(s)$，如何精确计算第 $i$ 根缆绳的路径长度 $l\_i(q)$ 及其对自由度的导数。
-
-### 5.1 缆绳在杆上的轨迹参数化
-
-假设缆绳在杆第 $s$ 处穿出截面上的局部点 $\\rho\_i(s)$（例如在截面圆周上的固定角度位置），在全局坐标下其位置为：
-
+\frac{dp}{ds} = R(s) e_3 \quad\quad(1)
 $$
-p_{cable,i}(s) = p(s) + R(s)\, \rho_i(s)
-$$若缆线穿出点沿截面角度固定且截面半径固定，则 $\\rho\_i(s) = r\_i$（常向量），单位为米。常见设置：$r\_i = [r\\cos\\alpha\_i, r\\sin\\alpha\_i, 0]^\\top$。
-
-### 5.2 路径长度（连续公式）
-
-对一根缆线，从 $s=a$（起点）到 $s=b$（终点）：
-
-$$l\_i = \\int\_a^b \\left| \\frac{d}{ds} p\_{cable,i}(s) \\right| ds
-\= \\int\_a^b \\left| p'(s) + R'(s) r\_i \\right| ds
-$$利用 $p'(s) = R(s)e\_3, ; R'(s) = R(s)\\widehat{\\kappa}(s)$：
-
 $$
-p'(s) + R'(s) r_i = R(s) \big( e_3 + \widehat{\kappa}(s) r_i \big)
-$$由于 $R(s)$ 为正交矩阵，范数不变：
-
-$$|p'(s) + R'(s) r\_i| = | e\_3 + \\widehat{\\kappa}(s) r\_i |
-$$因此得到一个非常简洁的公式：
-
+\frac{dR}{ds} = R(s) \widehat{\kappa}(s) \quad\quad(2)
 $$
-\boxed{ \; l_i = \int_a^b \sqrt{ \big(e_3 + \widehat{\kappa}(s) r_i\big)^\top \big(e_3 + \widehat{\kappa}(s) r_i\big) } \; ds \; }
-$$> 注：这公式体现了缆绳在各截面绕行形成附加的局部线元素长度，由局部曲率与截面偏移 $r\_i$ 决定。
 
-### 5.3 离散化后的单元表达（实用计算）
-
-若单元 $j$ 上 $\\kappa\_j$ 近似为常值，则在该单元上：
-
-$$l\_{i,j} \\approx | e\_3 + \\widehat{\\kappa\_j} r\_i | , \\Delta s\_j
-$$整根缆线长度：
-
-$$
-l_i \approx \sum_{j \in \text{path}} \| e_3 + \widehat{\kappa_j} r_i \| \, \Delta s_j
-$$这里 “path” 表示缆线穿过的单元集合（通常为 CMS 段所在的单元）。
-
-### 5.4 关于直立状态与基准长度
-
-直立（$\\kappa\\equiv 0$）时：
-$l\_{i,\\text{straight}} = \\int\_a^b |e\_3| ds = b-a$（等于弧长），因此定义驱动映射：
-
-$$\\Delta l\_i(q) = l\_{i,\\text{straight}} - l\_i(q)
-$$这与 PCC 版本的“缩短量”语义一致。
-
-## 6\. 总势能与梯度逐项推导（离散形式、逐步算子）
-
-总势能（离散）：
-
-$$
-U(\mathbf{x},\Delta l_{motor}) = U_{bend}(\mathbf{x}) + U_g(\mathbf{x}) + U_{cable}(\mathbf{x},\Delta l_{motor}) + U_{reg}(\mathbf{x})
-$$### 6.1 弯曲能（离散）
-
-由第 3 节离散化：
-
-$$U\_{bend} = \\tfrac12 \\sum\_{j=1}^N \\kappa\_j^\\top B\_j \\kappa\_j , \\Delta s\_j
-$$因此对单元 $j$ 的梯度（对 $\\kappa\_j$）：
-
-$$
-\frac{\partial U_{bend}}{\partial \kappa_j} = B_j \kappa_j \, \Delta s_j
-$$这是局部且对角的贡献，方便构成海森块。
-
-### 6.2 重力能（离散）
-
-若杆体离散为质元 $m\_j$（对应单元质心），单元质心位置为 $p\_{com,j}$（可由 $p\_{j-1},p\_j$ 线性近似或精确积分得到），则：
-
-$$U\_g = \\sum\_j m\_j g , (p\_{com,j})\_z
-$$梯度：
-
-$$
-\frac{\partial U_g}{\partial \kappa_k}
-= \sum_j m_j g \, \frac{\partial (p_{com,j})_z}{\partial \kappa_k}
-$$其中 $\\partial p\_{com,j}/\\partial \\kappa\_k$ 可由第 4 节变分方程（灵敏度方程）数值求解得到（通过同时积分灵敏度方程来获得对所有 $\\kappa\_k$ 的影响）。
-
-### 6.3 缆绳能（离散）与其梯度（逐步推导）
-
-离散化下，对于第 $i$ 根缆绳：
-
-$$l\_i(\\mathbf{x}) = \\sum\_{j \\in path(i)} \\ell\_{i,j}(\\kappa\_j), \\quad
-\\ell\_{i,j}(\\kappa\_j) = | e\_3 + \\widehat{\\kappa\_j} r\_i | \\Delta s\_j
-$$定义伸长/拉伸量（注意 sign）：
-
-$$
-\text{stretch}_i = \Delta l_{motor,i} - \Delta l_i(\mathbf{x})
-= \Delta l_{motor,i} - \big( l_{i,\text{straight}} - l_i(\mathbf{x}) \big)
-= \Delta l_{motor,i} - l_{i,\text{straight}} + l_i(\mathbf{x})
-$$（在实现中通常直接计算 $\\text{stretch} = \\Delta l\_{motor} - \\Delta l(\\mathbf{x})$）
-
-采用光滑化的零下截断（如你已实现的 `smooth_max_zero`）：
-
-$$s\_i = \\mathrm{smooth\_max\_zero}(\\text{stretch}\_i)
-$$缆绳能：
-
-$$
-U_{cable} = \tfrac12 k_c \sum_i s_i^2
-$$现在推导对单元自由度 $\\kappa\_j$ 的偏导。先对单个缆绳求导：
-
-$$\\frac{\\partial U\_{cable}}{\\partial \\kappa\_j}
-\= k\_c \\sum\_i s\_i \\frac{\\partial s\_i}{\\partial \\kappa\_j}
-\= k\_c \\sum\_i s\_i , s\_i'(\\text{stretch}\_i) \\cdot \\frac{\\partial \\text{stretch}\_i}{\\partial \\kappa\_j}
-$$其中 $s\_i'(\\cdot)$ 是 `smooth_max_zero` 的导数（你已实现）。而
-
-$$
-\frac{\partial \text{stretch}_i}{\partial \kappa_j} = \frac{\partial l_i(\mathbf{x})}{\partial \kappa_j}
-= \begin{cases}
-\sum_{k\in path(i)\cap \{j\}} \frac{\partial \ell_{i,k}}{\partial \kappa_j}, & \text{若单元 } j \in path(i) \\
-0, & \text{否则}
-\end{cases}
-$$而对单元 $k=j$，
-
-$$\\frac{\\partial \\ell\_{i,j}}{\\partial \\kappa\_j}
-\= \\frac{ \\big( e\_3 + \\widehat{\\kappa\_j} r\_i \\big)^\\top }{ | e\_3 + \\widehat{\\kappa\_j} r\_i | } \\cdot \\left( \\frac{\\partial \\big( \\widehat{\\kappa\_j} r\_i \\big) }{ \\partial \\kappa\_j } \\right) \\Delta s\_j
-$$注意：
-
-$$
-\widehat{\kappa} r_i = \kappa \times r_i
-$$并且对于分量 $\\kappa = [\\kappa\_x,\\kappa\_y,\\kappa\_z]$，
-
-$$\\frac{\\partial ( \\kappa \\times r\_i )}{\\partial \\kappa\_x} = e\_x \\times r\_i, \\quad
-\\frac{\\partial ( \\kappa \\times r\_i )}{\\partial \\kappa\_y} = e\_y \\times r\_i, \\quad
-\\frac{\\partial ( \\kappa \\times r\_i )}{\\partial \\kappa\_z} = e\_z \\times r\_i
-$$所以在向量形式中可以写成：
-
-$$
-\frac{\partial \ell_{i,j}}{\partial \kappa_j}
-= \left( \frac{ e_3 + \kappa_j \times r_i }{ \| e_3 + \kappa_j \times r_i \| } \right)^\top \cdot \big[ e_x \times r_i, \; e_y \times r_i, \; e_z \times r_i \big] \, \Delta s_j
-$$这给出对 $\\kappa\_j$ 的三列导数向量（或对 $\\kappa\_x,\\kappa\_y,\\kappa\_z$ 分别的偏导）。在忽略扭转的情形下（只有 $\\kappa\_x,\\kappa\_y$），取相应子向量即可。
-
-将这些局部贡献按缆绳汇总并加权 $k\_c s\_i s\_i'$ 就得到 $U\_{cable}$ 对所有 $\\kappa\_j$ 的梯度。
-
-### 6.4 正则项与总梯度
-
-若加入正则项 $U\_{reg} = \\tfrac12 \\lambda |\\mathbf{x}|^2$，其梯度为 $\\lambda \\mathbf{x}$。
-
-最终总梯度：
-
-$$\\nabla\_{\\mathbf{x}} U = \\underbrace{[B\_j \\kappa\_j \\Delta s\_j]*j}*{\\text{弯曲项}} + \\underbrace{ \\left[ \\sum\_{cells} m,g,\\tfrac{\\partial p\_{com}}{\\partial \\kappa\_j} \\right]*j }*{\\text{重力项}} + \\underbrace{ k\_c \\sum\_i s\_i s\_i' ; \\tfrac{\\partial l\_i}{\\partial \\kappa\_j} }\_{\\text{缆绳项}} + \\lambda \\mathbf{x}
-$$上式每一项在离散实现中都有明确求法：弯曲项直接；重力项与缆绳项通过灵敏度方程或局部导数公式获得。
-
-$$
-##7 \. Hessian（海森）与高效近似（Gauss-Newton）
-
-完整海森 $H = \\nabla\_{\\mathbf{x}}^2 U$ 包含每项二次导数：
-
-  * **弯曲项海森**是块对角：每个单元 $j$ 的贡献为 $B\_j \\Delta s\_j$（常数矩阵），直接可用。
-  * **缆绳项二阶导数**较复杂（包含二阶导数的向量商项），但在常见做法里用 Gauss-Newton 近似即可：
+*   公式(1)描述了**位置的变化**。根据不可伸长假设，位置点前进的方向始终是当前姿态下的切线方向 $d_3 = R e_3$。
+*   公式(2)描述了**姿态的变化**。它表明，当标架沿弧长前进微小距离 `ds` 时，其姿态的变化等效于绕 $\kappa(s)$ 向量旋转一个微小角度。其中，$\kappa_x$ 和 $\kappa_y$ 代表弯曲曲率，$\kappa_z$ 代表扭转曲率。$\widehat{\kappa}$ 是 $\kappa$ 对应的反对称矩阵（skew-symmetric matrix）：
     $$
-    $$$$H\_{cable} \\approx k\_c , J\_{l}^\\top , W , J\_{l}
+    \widehat{\kappa}(s) = \begin{bmatrix} 0 & -\kappa_z & \kappa_y \\ \kappa_z & 0 & -\kappa_x \\ -\kappa_y & \kappa_x & 0 \end{bmatrix}
     $$
-    $$$$其中 $J\_{l}$ 是 缆绳长度对自由度的雅可比矩阵（尺寸 \#cables × \#vars），而 $W$ 是对角权重矩阵：$W\_{ii} = s\_i'^2 + s\_i s\_i'' \\cdot (\\text{stretch}*i)$  —— 在很多实现中，取 $W*{ii}=s\_i'^2$（更稳定），或者在稳定的 smooth 函数下忽略 $s\_i''$ 项，简化为 $H\_{cable} \\approx k\_c J\_{l}^\\top J\_{l}$，即标准的 GN 近似。
-  * **重力海森**通常较小（来自 $\\partial^2 p\_{com}/\\partial \\kappa^2$），可以近似忽略或用数值差分/有限近似得到。
+    这种 $R \widehat{\omega}$ 的形式是旋转动力学中的标准表达。
 
-所以常用高性能近似：
+### **2.2 静力学：内力与内力矩的平衡方程**
 
-$$
-H \approx H_E + k_c \, J_{l}^\top J_{l} + \lambda I
-$$其中 $H\_E$ 是弯曲海森块对角矩阵。
-
-这个近似保留了主导项并显著降低代价 —— 并且在求解牛顿步时能快速产生稳定的更新方向（Gauss-Newton / Levenberg-Marquardt 类型）。
-
-
-## 8\. 任务雅可比（J\_task）通过隐函数定理的严格推导
-
-目标：对外循环，我们要把末端位姿（或任务量）对电机位移 $\\Delta l\_{motor}$ 的导数（任务雅可比）计算出来，供 Newton-style 更新使用。
-
-### 8.1 设定隐函数
-
-内循环平衡满足：
-
-$$F(\\mathbf{x}, \\Delta l\_{motor}) \\triangleq \\nabla\_{\\mathbf{x}} U(\\mathbf{x},\\Delta l\_{motor}) = 0
-$$对给定 $\\Delta l\_{motor}$ 求 $\\mathbf{x}=\\mathbf{x}(\\Delta l\_{motor})$。
-
-外部任务（例如末端位姿）由运动学映射：
+在静态平衡状态下，杆上任意微元段都处于力与力矩的平衡。通过对微元段进行受力分析，可以得到内部力 $n(s)$ 和内部力矩 $m(s)$ （均在局部坐标系下表示）沿弧长的变化规律：
 
 $$
-y(\mathbf{x}) = \text{task}(\mathbf{x}) \in \mathbb{R}^m
-$$我们希望计算：
-
-$$J\_{\\text{task}} = \\frac{\\partial y}{\\partial \\Delta l\_{motor}} = \\frac{\\partial y}{\\partial \\mathbf{x}} \\frac{\\partial \\mathbf{x}}{\\partial \\Delta l\_{motor}} = J\_{kin} ; \\frac{\\partial \\mathbf{x}}{\\partial \\Delta l\_{motor}}
-$$其中 $J\_{kin} = \\partial y / \\partial \\mathbf{x}$（可通过灵敏度方程或数值差分获得）。
-
-### 8.2 隐函数微分（隐函数定理）
-
-对 $F(\\mathbf{x}(\\Delta l), \\Delta l) = 0$ 两边对 $\\Delta l$ 求导：
-
+\frac{dn}{ds} + \widehat{\kappa}(s)n(s) + R^\top(s) f_{ext}(s) = 0 \quad\quad(3)
 $$
-\frac{\partial F}{\partial \mathbf{x}} \frac{\partial \mathbf{x}}{\partial \Delta l} + \frac{\partial F}{\partial \Delta l} = 0
-$$记 $H \\triangleq \\partial F / \\partial \\mathbf{x} = \\nabla\_{\\mathbf{x}}^2 U$（亦即总海森），并记
-
-$$C \\triangleq \\frac{\\partial F}{\\partial \\Delta l} = \\frac{\\partial}{\\partial \\Delta l} \\nabla\_{\\mathbf{x}} U(\\mathbf{x},\\Delta l)
-$$则：
-
 $$
-\frac{\partial \mathbf{x}}{\partial \Delta l} = - H^{-1} C
-$$因此任务雅可比：
-
-$$\\boxed{ ; J\_{task} = J\_{kin} ; \\left( - H^{-1} C \\right) ; }
-$$\#\#\# 8.3 具体计算 C（缆绳对梯度的影响）
-
-由于只有缆绳项直接依赖 $\\Delta l\_{motor}$，并且 $U\_{cable} = \\tfrac12 k\_c \\sum\_i s\_i^2$，其中 $s\_i = \\mathrm{smooth\_max\_zero}(\\text{stretch}\_i)$ 且 $\\text{stretch}*i = \\Delta l*{motor,i} - \\Delta l\_i(\\mathbf{x})$。
-
-先求对 $\\Delta l\_{motor}$ 的一阶偏导：
-
+\frac{dm}{ds} + \widehat{\kappa}(s)m(s) + (e_3 \times n(s)) + R^\top(s) l_{ext}(s) = 0 \quad\quad(4)
 $$
-\frac{\partial U_{cable}}{\partial \Delta l_{motor}} = k_c \, \mathrm{diag}( s_i s_i' )
-$$接着对梯度（即对 $\\mathbf{x}$ 的偏导）求偏导（链式）：
 
-$$C = \\frac{\\partial}{\\partial \\Delta l\_{motor}} \\nabla\_{\\mathbf{x}} U
-\= \\frac{\\partial}{\\partial \\Delta l\_{motor}} \\left( k\_c \\sum\_i s\_i s\_i' \\frac{\\partial l\_i}{\\partial \\mathbf{x}} \\right)
-$$但注意 $\\partial l\_i/\\partial \\mathbf{x}$ 不依赖于 $\\Delta l\_{motor}$，因此只有 $s\_i s\_i'$ 随 $\\Delta l\_{motor}$ 变化有项：
+*   $n(s), m(s)$ 分别是截面上的内力和内力矩向量。
+*   $f_{ext}, l_{ext}$ 是作用在杆上的分布外力（如重力）和外力矩（在全局坐标系下表示）。
+*   公式(4)中的 $e_3 \times n(s)$ 项是一个关键项，它表示由于内力 $n$ 作用在有曲率的杆上而产生的附加力矩。
 
+### **2.3 本构关系（线性弹性）**
+
+本构关系将杆的“变形”（曲率 $\kappa$）与其“内力”（内力矩 $m$）关联起来，如同弹簧的胡克定律。我们假设材料是线弹性的：
 $$
-C = - k_c \; J_l^\top \; \mathrm{diag}( s_i' )  \quad \text{(签名注意：取决于定义)}
-$$更直观的工程式（常用）：
-
-$$C = - k\_c ; J\_l^\\top ; D\_s
-$$其中 $J\_l$ 是缆绳长度对 $\\mathbf{x}$ 的雅可比（\#cables × \#vars），$D\_s$ 是对角矩阵，$D\_{s,ii} = s\_i'$（smooth 的一阶导）。符号细节按你对 $F=\\nabla\_x U$ 的定义会得到相应正负；在实现中直接按照链式法则编程即可。
-
-代入：
-
+m(s) = B(s) (\kappa(s) - \kappa_0(s)) \quad\quad(5)
 $$
-\frac{\partial \mathbf{x}}{\partial \Delta l_{motor}} = - H^{-1} C = H^{-1} \, k_c \, J_l^\top \, D_s
-$$因此
 
-$$J\_{task} = J\_{kin} , H^{-1} , k\_c , J\_l^\\top , D\_s
-$$或与前述符号统一：
+*   $B(s)$ 是截面的 $3 \times 3$ 抗弯扭刚度矩阵。对于各项同性材料，它是一个对角阵 $B = \text{diag}(EI_x, EI_y, GJ)$，其中 E 是杨氏模量，G 是剪切模量，I 是截面惯性矩，J 是极惯性矩。
+*   $\kappa_0$ 是杆在自然状态下的预曲率，在我们的项目中通常假设为零向量。
 
+---
+
+## **3. 离散化与数值变量**
+
+为了将上述连续的微分方程转化为可数值求解的代数方程，我们将连续的杆离散为 $N$ 个单元。这是一个标准的**有限元思想**，即用一系列参数已知的简单单元来逼近一个复杂的连续体。
+
+*   **核心假设**：我们假设在每个单元 $j$ （长度为 $\Delta s_j$）内部，其曲率向量 $\kappa_j \in \mathbb{R}^3$ 是**恒定**的。这是最简单的一阶（零阶保持）近似。
+*   **状态向量**：因此，整个机器人的瞬时形态可以被一个大的状态矩阵 $\mathbf{K} \in \mathbb{R}^{3 \times N}$ 完全定义。该矩阵的第 $j$ 列就是第 $j$ 个单元的曲率向量 $\kappa_j$。这个包含 $3N$ 个标量变量的矩阵 $\mathbf{K}$，就是我们内循环（静力学平衡）求解器需要求解的核心变量。
+
+---
+
+## **4. 正运动学与灵敏度方程**
+
+### **4.1 正运动学 (FK)**
+
+正运动学是从已知的状态（曲率矩阵 $\mathbf{K}$）计算出机器人任意点的位姿（尤其是末端位姿）的过程。我们通过对公式(1)和(2)进行**数值积分**来实现。
+
+*   **求解方法**：从机器人基座已知的初始位姿 ($p_0=0, R_0=I$) 开始，我们利用**四阶龙格-库塔法 (RK4)**，一个单元一个单元地递推计算每个单元末端的位姿，直到最后一个单元，从而得到末端位姿 $T_{tip} = (p_N, R_N)$。RK4 方法通过在每个积分步内进行四次函数求值，实现了较高的精度和稳定性。
+
+### **4.2 灵敏度方程（变分方程）**
+
+为了进行高效的基于梯度的优化，我们不仅要知道末端位姿，还需要知道它对状态变量 $\mathbf{K}$ 中每个分量的导数，即运动学雅可比矩阵 $J_{kin}=\frac{\partial(\text{Pose})}{\partial \mathbf{K}}$。
+
+*   **方法**：直接对整个FK函数进行数值差分虽然可行，但效率极低（需要 $3N+1$ 次FK计算）。更高效的方法是求解**变分方程**。其思想是：对运动学方程(1)和(2)关于状态变量 $\kappa_{i,j}$（第j个单元的第i个曲率分量）求偏导，得到一个描述“位姿的微小变化” $\delta p = \frac{\partial p}{\partial \kappa_{i,j}}$ 和 $\delta R = \frac{\partial R}{\partial \kappa_{i,j}}$ 如何沿杆传播的线性常微分方程：
+    $$
+    \frac{d(\delta p)}{ds} = \delta R \cdot e_3
+    $$
+    $$
+    \frac{d(\delta R)}{ds} = \delta R \cdot \widehat{\kappa} + R \cdot \frac{\partial \widehat{\kappa}}{\partial \kappa_{i,j}}
+    $$
+*   **求解**：这个增广的线性ODE系统可以与主运动学方程一同使用RK4进行积分。这样，在一次前向积分过程中，我们就能同时、高效地计算出末端位姿和它对所有 $3N$ 个状态变量的导数（即完整的雅可比矩阵）。
+
+---
+
+## **5. 缆绳路径与长度映射（积分模型 V2.1）**
+
+这是连接“驱动输入”与“机器人形变”的核心桥梁，也是 Sim2Real 校准的重点。
+
+### **5.1 缆绳路径的参数化与连续积分公式**
+
+*   **轨迹参数化**：假设第 $i$ 根缆绳在截面上的固定偏移向量为 $r_i$。当杆的中心线位置为 $p(s)$，姿态为 $R(s)$ 时，缆绳上对应点的全局位置为：
+    $$ p_{cable,i}(s) = p(s) + R(s) r_i $$
+*   **长度推导**：对上式沿弧长 `s` 求导，可得缆绳路径的切向量：
+    $$
+    \begin{aligned}
+    p'_{cable,i}(s) &= p'(s) + R'(s)r_i \\
+    &= R(s)e_3 + R(s)\widehat{\kappa}(s)r_i \\
+    &= R(s)(e_3 + \widehat{\kappa}(s)r_i) = R(s)(e_3 + \kappa(s) \times r_i)
+    \end{aligned}
+    $$
+    缆绳的微元长度为 $ds_{cable} = \|p'_{cable,i}(s)\| ds$。由于 $R(s)$ 是旋转矩阵，它不改变向量的模长（即 $\|Rv\| = \|v\|$），因此：
+    $$
+    ds_{cable} = \|e_3 + \kappa(s) \times r_i\| ds
+    $$
+*   **引入Sim2Real修正的连续积分公式 (V2.1)**：为解决理论与实际的偏差，我们在上述纯几何模型中引入两个关键的校正参数：
+    1.  **有效半径缩放 (`effective_radius_scale`) $\alpha_r$**: 一个全局缩放系数，用于放大名义上的缆绳半径 $r_i$。**物理意义**：它用于补偿理论模型与真实世界中滑轮、导管等效力臂之间的差距，是解决“仿真驱动量远小于实验驱动量”这一量级问题的核心。
+    2.  **几何增益 (`gamma(s)`) $\gamma(s)$**: 一个沿弧长分段常数的函数，用于调整不同段（CMS1, CMS2）的弯曲对缆绳长度的贡献权重。**物理意义**：它允许我们建模不同段之间弯曲效率的差异。例如，`gamma_1 > gamma_2` 可以模拟 CMS1 段比 CMS2 段更容易被同一根缆绳“拉弯”的物理现象。
+    
+    修正后的缆绳总长度的严格表达式为：
+    $$ \boxed{ \; l_i = \int_a^b \| e_3 + \gamma(s) \cdot (\kappa(s) \times (\alpha_r r_i)) \| \; ds \; } $$
+
+### **5.2 离散化计算**
+
+在离散化的单元 $j$ 上，由于 $\kappa_j$ 是常数，上述积分变为简单的乘法。第i根缆绳在单元j上的长度贡献为：
 $$
-J_{task} = J_{kin} \, (-H^{-1} C)
-$$这个表达式是外循环中牛顿步所需的核心雅可比。注意实际实现中我们使用 $H$ 的近似（见第 7 节），并充分利用矩阵乘算的稀疏性与结构以加速求解。
-
-## 9\. 数值方案与算法（伪代码）
-
-### 9.1 内循环（静力学平衡求解）
-
-**目标**：给定 $\\Delta l\_{motor}$，求 $\\mathbf{x}^\\star = \\arg\\min U(\\mathbf{x},\\Delta l\_{motor})$。
-
-**伪代码**：
-
-```python
-function solve_static_equilibrium(x0, delta_l_motor, params):
-x = x0
-for iter in 1..max_iter:
-# 1) 前向积分：给定 x（各单元kappa），用 RK4 得到 p(s), R(s)
-R, p = forward_cosserat(x, params)
-
-# 2) 计算 U, gradient g = ∇_x U  (弯曲项直接, 重力和缆绳用灵敏度方程或局部公式)
-g = compute_gradient(x, R, p, delta_l_motor)
-if ||g|| < tol: 
-break
-
-# 3) 近似 H: H ≈ H_E + k_c * J_l^T J_l + lambda I
-H_approx = assemble_H_approx(x, R, p)
-
-# 4) 解线性系统（或用 L-BFGS 直接）： solve H d = -g
-d = solve_linear(H_approx, -g)
-
-# 5) line search / damping
-alpha = line_search(U, x, d)
-x = x + alpha * d
-
-return x
-```
-
-**实现选项**：
-
-* 若变量维度较大（\>100），用 L-BFGS-B；若 `H_approx` 性能好，可用直接求解得到 Newton 步（更快收敛）。
-
-### 9.2 外循环（逆运动学：PSO + Newton）
-
-**伪代码**：
-
-```python
-function solve_ik(target_pose, config):
-# Phase 1: PSO in Δl space
-best_delta_l = PSO_optimize(cost=cost_function_with_inner_solver)
-
-# Phase 2: Newton refinement
-delta_l = best_delta_l
-for iter in 1..max_outer_iter:
-# inner solve
-x = solve_static_equilibrium(x0_guess, delta_l, params)
-
-# compute task error y(x) - target
-err = task_error(x, target_pose)
-if norm(err) < tol: 
-return success
-
-# compute J_kin
-J_kin = compute_task_jacobian_via_sensitivities(x)
-
-# compute H_approx and C
-H_approx = assemble_H_approx(...)
-C = assemble_C(...)
-
-# compute d x / d delta_l = - H^{-1} C
-DxDdl = solve_linear(H_approx, -C)   # solve H * M = -C  (matrix solve)
-J_task = J_kin @ DxDdl
-
-# compute outer update using damping: solve (J_task^T J_task + mu I) d = -J_task^T err
-d_delta_l = solve_outer_linear(...)
-
-# apply step with line_search
-apply_step_with_line_search(delta_l, d_delta_l)
-
-return result
-```
-
-### 9.3 Warm-start、Homotopy 策略（工程实用）
-
-* **pretension continuation**：从小预紧开始，逐步增大到目标预紧，每步用前一解热启动；
-* **beta (smooth) continuation**：逐步增加 $\\beta$（smooth 的陡峭度），避免 sudden nonconvexity；
-* **grid warm-start**：在 workspace 采样时，引入邻点热启动策略（nearest neighbor warm start）。
-
-## 10\. 实现细节、复杂度与参数建议
-
-### 10.1 变量维数与计算代价
-
-* 若每段取 $N\_{seg}$ 单元，整杆变量数 $n\_{var} = 2 \\times (N\_{pss}+N\_{c1}+N\_{c2})$（若只取 $\\kappa\_x,\\kappa\_y$）。
-* 常见选择：每段 8–12 单元 → 总变量 \~ 48–72；内循环的 Hessian 近似求逆（或解线性系统）成本 $O(n\_{var}^3)$（直接法）或 $O(n\_{var}^2)$（稀疏/解法器），可采用鲁棒稀疏解算器＋并行化。
-
-### 10.2 数值精度与稳定性
-
-* 若 $\\kappa$ 较大，RK4 积分步长 $\\Delta s$ 需足够小以保持旋转精度；建议 $\\Delta s \\le 0.005m$（工程经验）。
-* smooth 函数 `smooth_max_zero` 的 $\\beta$ 对收敛性敏感：从小到大做 continuation（例如 5→10→20→50）。
-
-### 10.3 并行化与加速
-
-* 前向积分与灵敏度方程可在单个样本上串行计算，但 workspace 多点采样时可在样本层面并行（多进程/多机）。
-* 对于外循环 PSO，各粒子的内循环独立，天然并行化。
-
-### 10.4 模块建议（代码组织）
-
-* `kinematics_cosserat.py`：前向积分 + 灵敏度方程求解器（提供 `forward(x)` 和 `forward_with_sensitivities(x)` 接口）。
-* `cable_mapping.py`：根据 $p(s),R(s)$ 与 $r\_i$ 计算每根缆绳长度与其对 $x$ 的雅可比（局部单元公式）。
-* `statics_cosserat.py`：能量、梯度、Hessian 近似（接口：`U_and_grad(x, delta_l)`、`H_approx(x)`）。
-* `solver_cosserat.py`：内循环优化（L-BFGS-B 与 GN 结合）。
-* `outer_solver_cosserat.py`：PSO + Newton 逆解逻辑。
-* `utils/smooth.py`：`smooth_max_zero` 与其一、二阶导实现及 beta-continuation helpers。
-
-## 总结（要点回顾）
-
-* Cosserat 模型从第一性原理出发，能 **严格得出缆绳长度的积分表达**，并由此计算对曲率分布的灵敏度，保证能量与梯度在物理上自洽。
-* 关键数学公式：
-* 缆绳长度： $l\_i = \\int\_a^b |e\_3 + \\widehat{\\kappa}(s) r\_i|, ds$
-* 能量梯度的缆绳贡献通过 $\\partial \\ell\_{i,j} / \\partial \\kappa\_j$ 的显式表达计算；弯曲能梯度直接为 $B\_j \\kappa\_j \\Delta s$。
-* 任务雅可比通过隐函数定理得到： $J\_{task} = J\_{kin} (-H^{-1} C)$（并给出 $C$ 的构造方式）。
-* 数值实现需要处理灵敏度方程（变分方程）的数值解与矩阵方程的高效求解；工程上常借助 Gauss-Newton 近似来达到速度/准确度平衡。
-* 推荐的过渡策略：先实现 Hybrid 形式（把每个 CMS 细分若干单元但仍用 PCC 形式）作为验证，再迁移到完整 Cosserat 实现并用 RK4 + 灵敏度方程做精确梯度，最终把 GN 近似与并行化结合以恢复运行效率。
+\ell_{i,j} = \|e_3 + \gamma_j \cdot (\kappa_j \times (\alpha_r r_i))\| \Delta s_j
 $$
+其中 $\gamma_j$ 根据单元所属的段（PSS, CMS1或CMS2）取值为 `1`, `gamma_1` 或 `gamma_2`。整根缆绳总长为所有穿过的单元贡献之和 $l_i = \sum_j \ell_{i,j}$。
+
+### **5.3 驱动映射与梯度一致性**
+
+我们关心的物理量是缆绳因弯曲而产生的**几何缩短量**，定义为 $\Delta l_i(\mathbf{K}) = l_{i,\text{straight}} - l_i(\mathbf{K})$。这是保证优化器稳定工作的**最高准则**：在代码实现中，用于计算驱动雅可比 `calculate_cable_jacobian` 的方法，必须与 `calculate_drive_mapping` 函数在数学上完全等价。任何不一致都会为优化器提供错误的梯度信息，导致其难以收敛或收敛到错误的结果。
+
+---
+
+## **6. 能量函数与梯度/海森推导**
+
+内循环求解器的目标是最小化总势能 $U = U_{bend} + U_g + U_{cable} + U_{reg}$。
+
+*   **弯曲能 ($U_{bend}$)**：$U_{bend} = \tfrac12\sum_j \kappa_j^\top B_j\kappa_j \Delta s_j$。这是最基础的线性弹性能，其梯度为 $\nabla_{\kappa_j} U_{bend} = B_j \kappa_j \Delta s_j$。
+*   **重力能 ($U_g$)**: $U_g = \sum_j m_j g (p_{com,j})_z$。由于 $p_{com,j}$ 是关于 $\kappa_1, ..., \kappa_j$ 的复杂非线性函数，其梯度在代码中通过数值差分计算，以保证鲁棒性。
+*   **缆绳能 ($U_{cable}$)**：缆绳拉伸量为 $s_i=\Delta l_{motor,i}-\Delta l_i(\mathbf{K})$。
+    $$
+    U_{cable}=\tfrac12 k_c\sum_i \text{smooth\_max\_zero}(s_i)^2 - \sum_i f_{pre} \Delta l_i(\mathbf{K})
+    $$
+    *   第一项是缆绳的**弹性拉伸能**。我们使用 `smooth_max_zero` 函数（如 $x \cdot \text{sigmoid}(\beta x)$）来近似 `max(0, x)`，因为后者在原点不可导，会使梯度优化算法失效。
+    *   第二项是**预紧力做的功**。
+    *   其梯度通过链式法则计算：$\nabla_\mathbf{K} U_{cable} = \frac{\partial U_{cable}}{\partial s} \frac{\partial s}{\partial \Delta l_i} \frac{\partial \Delta l_i}{\partial \mathbf{K}} = \dots \cdot (-J_l)$，其中 $J_l$ 是缆绳雅可比。
+*   **正则项 ($U_{reg}$)**：$U_{reg}=\tfrac12\lambda \|\mathbf{K}\|_F^2$。这是一个数值稳定项（Tikhonov正则化），用于在解不唯一或病态时（如 $\kappa$ 接近零），惩罚过大的曲率，保证海森矩阵的正定性，从而避免求解器失败。
+*   **海森矩阵近似 (Hessian Approximation)**：精确计算总能量的海森矩阵 $H = \nabla_\mathbf{K}^2 U$ 非常复杂。为了效率，我们采用 **Gauss-Newton 近似**。该方法保留了能量函数中二次型最强的部分（弯曲能和缆绳拉伸能），并忽略了其他高阶项。物理意义上，这是抓住了能量盆地的主要形状。
+    $$ H \approx \underbrace{H_{bend}}_{\text{精确}} + \underbrace{k_c J_{l}^\top J_{l}}_{\text{近似}} + \lambda I $$
+    这种近似保证了 $H$ 是半正定的，有利于优化算法的稳定性。
+
+---
+
+## **7. 外循环雅可比：隐函数定理的严格推导**
+
+外循环（IK）求解器需要计算任务雅可比 $J_{task}=\frac{\partial(\text{Pose})}{\partial \Delta l_{motor}}$。
+
+1.  **定义隐函数**：在静力学平衡点，总势能的梯度为零：
+    $$ F(\mathbf{K}, \Delta l_{motor}) \triangleq \nabla_\mathbf{K} U(\mathbf{K}, \Delta l_{motor}) = 0 $$
+    这个方程定义了一个“平衡流形”，即所有可能的平衡状态 $(\mathbf{K}, \Delta l_{motor})$ 组成的曲面。它隐式地定义了 $\mathbf{K}$ 是 $\Delta l_{motor}$ 的函数。
+
+2.  **对隐函数求全微分**：为了维持在平衡流形上，当驱动 $\Delta l_{motor}$ 发生微小变化 $d(\Delta l_{motor})$ 时，状态 $\mathbf{K}$ 也必须相应地变化 $d\mathbf{K}$，使得 $F$ 的总变化为零：
+    $$ dF = \frac{\partial F}{\partial \mathbf{K}} d\mathbf{K} + \frac{\partial F}{\partial \Delta l_{motor}} d(\Delta l_{motor}) = 0 $$
+
+3.  **整理求解**：
+    $$ \frac{\partial F}{\partial \mathbf{K}} d\mathbf{K} = - \frac{\partial F}{\partial \Delta l_{motor}} d(\Delta l_{motor}) $$
+    $$ \frac{d\mathbf{K}}{d(\Delta l_{motor})} = - \left( \frac{\partial F}{\partial \mathbf{K}} \right)^{-1} \left( \frac{\partial F}{\partial \Delta l_{motor}} \right) $$
+    这里的两个偏导数项分别是总势能的二阶导数：
+    *   $\frac{\partial F}{\partial \mathbf{K}} = \nabla^2_{\mathbf{K},\mathbf{K}} U = H$ (海森矩阵)
+    *   $\frac{\partial F}{\partial \Delta l_{motor}} = \nabla^2_{\mathbf{K},\Delta l_{motor}} U = C$ (耦合矩阵)
+    因此，$\frac{\partial \mathbf{K}}{\partial \Delta l_{motor}} = -H^{-1} C$。
+
+4.  **应用链式法则得到任务雅可比**：我们最终关心的是末端位姿的变化。通过链式法则，将状态变化传递到末端位姿变化：
+    $$ \boxed{ \; J_{task} = \frac{\partial(\text{Pose})}{\partial \Delta l_{motor}} = \frac{\partial(\text{Pose})}{\partial \mathbf{K}} \frac{\partial \mathbf{K}}{\partial \Delta l_{motor}} = J_{kin} \left( - H^{-1} C \right) \; } $$
+    这个公式是连接内外循环的关键，它允许我们用解析法（而非缓慢的数值差分法）高效计算外循环所需的雅可比矩阵。
+
+---
+
+## **8. Sim2Real 建模与参数校正流程**
+
+这是连接仿真与现实的关键步骤，是一个系统性的迭代优化过程。
+
+*   **Step 1: 确认几何与物理基准**
+    *   **几何确认**：确保模型中的几何参数（段长，缆绳孔径和角度）与真实机器人硬件的工程图纸完全一致。
+    *   **物理估计**：基于材料属性（杨氏模量、剪切模量）和截面几何，为刚度参数 `pss_bending_stiffness` 和 `cms_bending_stiffness` 设定一个合理的、有物理依据的初始值。
+*   **Step 2: 采集实验数据**
+    *   **实验设计**：进行单缆驱动实验。依次驱动每一根（或对称的一组）缆绳，使用高精度运动捕捉系统精确记录电机输入 $\Delta l_{motor}$ 与机器人末端或关键点三维位置的关系曲线。
+*   **Step 3: 构建拟合目标函数并优化**
+    *   **仿真模拟**：在仿真环境中，精确复现Step 2的实验过程。
+    *   **代价函数**：定义一个代价函数，通常是仿真预测位置与真实实验位置之间的**均方根误差 (RMSE)**。
+    *   **待优化参数与调节技巧**:
+        *   **`effective_radius_scale` (最优先)**: 该参数直接影响运动的**量级**。应首先调节它，使仿真中预测的缆绳几何缩短量 `delta_l` 与实验中的电机位移在数量级上匹配。这是校准的“第一推动力”。
+        *   **`gamma_1`, `gamma_2`**: 在量级基本正确后，调节这两个参数来拟合运动的**形态**。例如，如果实验中机器人头部弯曲比根部更显著，应尝试增大 `gamma_1` 相对于 `gamma_2` 的值。
+        *   **`cms_bending_stiffness` (微调)**: 在形态基本吻合后，微调此参数以匹配机器人抵抗重力“下垂”的程度或整体的“软硬”感觉。
+*   **Step 4: 交叉验证**
+    *   使用优化得到的参数集，在仿真中运行一组**新的、未用于训练**的驱动指令（例如，同时驱动多根非对称缆绳），对比仿真与实验结果，以检验模型的泛化能力和预测精度。
+
+---
+
+## **9. 数值方案与算法伪代码**
+
+### **9.1 内循环（静力学平衡求解）**
+
+*   **算法选择**：**L-BFGS-B**。这是一种拟牛顿法，非常适合求解此问题。
+    *   **优点1 (效率)**: 它利用梯度信息，比无梯度方法（如Nelder-Mead）收敛快得多。同时，它通过存储历史梯度信息来近似海森矩阵的逆，避免了直接计算和求逆复杂的海森矩阵，实现了速度和精度之间的良好平衡。
+    *   **优点2 (约束处理)**: 名称中的 "B" 代表 "Box-constrained"，意味着它可以直接处理变量的边界约束（如 `kappa_bound`），这对于防止数值不稳定至关重要。
+
+### **9.2 外循环（逆运动学：PSO + TRF）**
+
+*   **设计哲学**：IK 是一个高度非凸的优化问题，单一算法难以胜任。我们采用“全局探索+局部精炼”的混合策略。
+*   **伪代码/实现**:
+    ```python
+    function solve_ik(target_pose, config):
+        # Phase 1: PSO 全局探索 (并行化)
+        # 目的：在广阔的8维驱动空间 delta_l 中，进行梯度无关的全局搜索，
+        #       快速找到一个“有希望”的区域，避免陷入差的局部最优。
+        # 代价函数：IK 误差（位置误差(mm) + 姿态误差(rad)），
+        #           其中每次评估都需要调用一次完整的内循环求解器。
+        best_delta_l_guess = PSO_parallel_optimize(cost_function_with_inner_solver)
+
+        # Phase 2: TRF 局部精炼
+        # 目的：从 PSO 找到的优质起点开始，利用梯度信息（任务雅可比）
+        #       进行快速、高精度的局部寻优。
+        delta_l_solution = least_squares(
+            fun=calculate_ik_residual,
+            x0=best_delta_l_guess,
+            jac=calculate_task_jacobian, # 可以是数值法或解析法
+            method='trf', # 信赖域反射法，比牛顿法更鲁棒
+            ...
+        )
+        return delta_l_solution
+    ```
+
+---
+
+## **10. 工程实现与关键物理效应分析**
+
+*   **模块化代码**：
+    *   `kinematics.py`：负责FK和运动学雅可比，是机器人的“骨骼”。
+    *   `statics.py`：负责所有能量和梯度的计算，是模型的“灵魂”和“肌肉”。
+    *   `solver.py` & `outer_solver.py`：分别实现内、外循环求解器，是驱动模型的“大脑”。
+*   **数值稳定性**：
+    *   **Beta-Continuation策略**：在使用`smooth_max_zero`时，可以在优化初期使用较小的`beta`值（函数更平滑），待解稳定后再逐渐增大`beta`（更接近真实的`max`函数），有助于引导求解器找到好的解。
+    *   **海森矩阵正则化**：在求解线性方程组 $H \cdot d = -g$ 时，对海森矩阵 $H$ 进行正则化（如加上 $\lambda I$）或Levenberg-Marquardt阻尼处理，可以有效解决 $H$ 病态或非正定的问题。
+*   **关键物理效应分析：刚度 vs 重力耦合**
+    *   **现象**: 在拉动短缆（主要作用于CMS1）时，未被直接驱动的 CMS2 段依然会发生弯曲。
+    *   **根源**: 这是**重力势能**与**弹性势能**竞争并达到平衡的必然结果。当 CMS1 弯曲时，CMS2 的整体姿态和位置发生改变，其重心也随之移动。为了最小化总重力势能（即让重心尽可能低），系统会倾向于让CMS2发生一定的“下垂”。
+    *   **控制因素**: 这种“下垂”效应的程度，直接取决于 `cms_bending_stiffness` 的大小。
+        *   **低刚度**: 抵抗弯曲所需的弹性势能较小，因此系统愿意“支付”这点弹性势能，以换取重力势能的大幅降低。结果是CMS2 发生显著的重力下垂。
+        *   **高刚度**: 抵抗弯曲所需的弹性势能非常大，系统“不舍得”支付。因此，即使重力势能不是最低，系统也会选择保持更接近直立的姿态，以避免巨大的弹性势能惩罚。
+    *   **调试指南**: 当观察到不符合直觉的被动运动时，应首先检查并调整相关组件的**刚度**参数，并分析其与重力、驱动力等外部载荷的相互作用。这是理解连续体机器人复杂行为的关键。

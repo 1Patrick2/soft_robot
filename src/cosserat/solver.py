@@ -46,11 +46,15 @@ def solve_static_equilibrium(kappas_guess, delta_l_motor, params, solver_options
     else:
         lbfgsb_opts = solver_options
 
+    kappa_bound = params.get('Solver', {}).get('kappa_bound', 20.0)
+    bounds = [(-kappa_bound, kappa_bound)] * kappas_guess.size
+
     result = minimize(
         objective_function, 
         kappas_guess_flat, 
         method='L-BFGS-B',
         jac=jacobian_function, 
+        bounds=bounds,
         options=lbfgsb_opts
     )
 
